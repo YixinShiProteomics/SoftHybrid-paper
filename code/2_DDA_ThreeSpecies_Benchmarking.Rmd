@@ -1,0 +1,2106 @@
+---
+title: "1_DIA_ThreeSpecies_Benchmarking"
+author: "Yixin Shi"
+date: "2025-08-05"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+pacman::p_load(magrittr, ggplot2, ggVennDiagram, pheatmap, ggridges, umap, limma, dplyr, tidyr, viridis, gridExtra, stringr, ggsci, clusterProfiler, org.Mm.eg.db, UpSetR, missForest,ComplexHeatmap, WGCNA, org.Hs.eg.db, GOSemSim, ggrepel, VennDiagram, GSVA, tibble, purrr, scales, imputeLCMD, patchwork)
+```
+
+# Working Directory
+```{r}
+rm(list = ls())
+getwd()
+```
+
+# Function Settings
+```{r}
+load_filtered_protein_matrix <- function(file_path) {
+  df <- read.csv(file_path, sep = "\t", header = TRUE)
+  sample_names <- unlist(lapply(strsplit(colnames(df)[79:94], split = '.', fixed = TRUE), function(x) x[1]))
+  colnames(df)[79:94] <- sample_names
+  df <- df[,c(3:4,79:94)]
+  colnames(df)[1:2] <- c('Protein.Names', 'Genes')
+  filter_protein <- df$Genes[!grepl("KRT", df$Genes)]
+  filter_protein <- filter_protein[!filter_protein %in% c("CSTA", "CDSN", "CASP14", "HRNR", 
+                                                        "CST6", "KPRP", "FLG2", "EVPL", "IVL", "PKP1")]
+  df <- df[df$Genes %in% filter_protein, ]
+  df <- df[, -2]
+  rownames(df) <- df$Protein.Names
+  df <- df[, -1]
+  df <- df[rowSums(df == 0) != ncol(df), ]
+  df[df == 0] <- NA
+  return(df)
+}
+
+extract_metadata_from_colnames <- function(expr_matrix) {
+  metadata <- data.frame(
+    Sample = colnames(expr_matrix),
+    Group  = unlist(lapply(strsplit(colnames(expr_matrix), split = '_', fixed = TRUE), function(x) x[1]))
+  )
+  rownames(metadata) <- metadata$Sample
+  metadata$Group <- factor(metadata$Group)
+  levels(metadata$Group) <- c('SampleA', 'SampleB')
+  return(metadata)
+}
+
+reshape_intensity_long <- function(intensity_matrix, metadata) {
+  long_df <- intensity_matrix %>%
+    mutate(Protein = rownames(.)) %>%
+    pivot_longer(cols = colnames(intensity_matrix),
+                 names_to = "Sample",
+                 values_to = "Intensity")
+  long_df$Group <- plyr::mapvalues(long_df$Sample,
+                                   from = metadata$Sample,
+                                   to = metadata$Group)
+  long_df$Group <- factor(long_df$Group, levels = c(1, 2))
+  levels(long_df$Group) <- c("SampleA", "SampleB")
+  long_df$Sample <- factor(long_df$Sample, levels = metadata$Sample)
+  return(long_df)
+}
+
+plot_group_missing_rate <- function(intensity_matrix, long_df, metadata, label = "", nrow_facet = 1) {
+  n <- length(unique(rownames(intensity_matrix)))
+  aggr <- aggregate(is.na(Intensity) / n ~ Sample, data = long_df, FUN = sum)
+  colnames(aggr)[2] <- 'missing_rate'
+  aggr$group <- plyr::mapvalues(aggr$Sample,
+                                from = metadata$Sample,
+                                to = metadata$Group)
+  aggr$group <- factor(aggr$group, levels = c(1, 2))
+  levels(aggr$group) <- c('SampleA','SampleB')
+  global_missing <- sum(is.na(long_df$Intensity))
+  global_missing_rate <- global_missing / n / length(metadata$Sample)
+  missing_mean <- mean(aggr$missing_rate)
+  p <- ggplot(aggr, aes(x = factor(Sample, levels = Sample), y = missing_rate)) +
+    geom_bar(stat = 'identity', position = 'dodge', color = "black", fill = "#8AA4C1") +
+    geom_hline(yintercept = missing_mean, linetype = 'dashed', color = "red") +
+    scale_y_continuous(
+      limits = c(0,0.3),
+      breaks = seq(0, 0.3, by = 0.05)) +
+    xlab("Sample") +
+    ylab("Missing rate") +
+    ggtitle(paste0("NA ratio (", label, ", out of ", 
+                   n, " proteins; Global: ", 
+                   round(global_missing_rate, digits = 2), ")")) +
+    facet_wrap(~group, nrow = nrow_facet, scales = "free_x") +
+    theme_bw() +
+    theme(
+    panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+    text             = element_text(size = 13),
+    axis.text        = element_text(size = 13, face = "bold"),
+    axis.text.x      = element_blank(),
+    axis.text.y      = element_text(color = "black", size = 13, face = "bold"), 
+    axis.ticks.length= unit(2, "mm"),
+    axis.title       = element_text(size = 14, face = "bold"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position  = "right",
+    legend.title     = element_text(size = 13, face = "bold"),
+    legend.text      = element_text(size = 12),
+    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15),
+    strip.text       = element_text(size = 13, face = "bold") 
+  )
+  return(p)
+}
+
+filter_log2_matrix_by_missing_rate <- function(intensity_matrix, intensity_long, threshold = 0.9) {
+  tb_cor <- data.frame(
+    row.names = rownames(intensity_matrix),
+    missing_rate = rowSums(is.na(intensity_matrix)) / ncol(intensity_matrix),
+    abundance = rowMeans(log2(intensity_matrix), na.rm = TRUE)
+  )
+  intensity_long_log2 <- intensity_long
+  intensity_long_log2$Intensity <- log2(intensity_long_log2$Intensity)
+  valid_proteins <- rownames(tb_cor)[tb_cor$missing_rate < threshold]
+  long_filtered <- intensity_long_log2 %>%
+    filter(Protein %in% valid_proteins)
+  wide_filtered <- long_filtered %>%
+    dplyr::select(-Group) %>%
+    pivot_wider(names_from = Sample, values_from = Intensity) %>%
+    as.data.frame()
+  rownames(wide_filtered) <- wide_filtered$Protein
+  wide_filtered <- wide_filtered[, -1]  
+  return(wide_filtered)
+}
+
+median_centering <- function(df) {
+  df_norm <- as.data.frame(apply(df, 2, function(x) {
+    gMedian = median(x, na.rm = TRUE)
+    x - gMedian
+  }
+  ))
+  return(df_norm)
+}
+
+run_minprob <- function(data_list, 
+                              q = 0.01, 
+                              tune.sigma = 0.7, 
+                              seed = 25, 
+                              save_dir = "./output_DDA", 
+                              prefix = "minProb") {
+  if (!dir.exists(save_dir)) dir.create(save_dir, recursive = TRUE)
+  results <- list()
+  for (name in names(data_list)) {
+    cat("Running minProb imputation for:", name, "\n")
+    set.seed(seed)
+    data <- data_list[[name]]
+    time_taken <- system.time({
+      result <- imputeLCMD::impute.MinProb(data, q = q, tune.sigma = tune.sigma)
+    })
+    save_path <- file.path(save_dir, paste0(prefix, "_", name, ".Rdata"))
+    save(result, file = save_path)
+    results[[name]] <- list(
+      imputed_data = result,
+      time = time_taken,
+      save_path = save_path
+    )
+    print(time_taken)
+  }
+  return(results)
+}
+
+run_gaussian_imputation <- function(df, 
+                width = 0.3, 
+                downshift = 1.8, 
+                seed = 25, 
+                save_path = NULL) {
+  set.seed(seed)
+  observed_values <- unlist(df)[!is.na(unlist(df))]
+  mu <- mean(observed_values)
+  sigma <- sd(observed_values)
+  impute_mean <- mu - downshift * sigma
+  impute_sd <- sigma * width
+  time_taken <- system.time({
+    imputed_df <- df
+    na_indices <- which(is.na(df), arr.ind = TRUE)
+    imputed_df[na_indices] <- rnorm(n = nrow(na_indices), mean = impute_mean, sd = impute_sd)
+  })
+  if (!is.null(save_path)) {
+    save(imputed_df, file = save_path)
+  }
+  print(time_taken)
+  return(list(
+    imputed_data = imputed_df,
+    time = time_taken,
+    save_path = save_path
+  ))
+}
+
+run_gaussian <- function(data_list, 
+                               width = 0.3, 
+                               downshift = 1.8, 
+                               seed = 25, 
+                               save_dir = "./output_DDA", 
+                               prefix = "GS") {
+  if (!dir.exists(save_dir)) dir.create(save_dir, recursive = TRUE)
+  results <- list()
+  for (name in names(data_list)) {
+    cat("Running Gaussian imputation for:", name, "\n")
+    save_path <- file.path(save_dir, paste0(prefix, "_", name, ".Rdata"))
+    result <- run_gaussian_imputation(
+      df = data_list[[name]],
+      width = width,
+      downshift = downshift,
+      seed = seed,
+      save_path = save_path
+    )
+    results[[name]] <- result
+  }
+  return(results)
+}
+
+run_knn_imputation <- function(df, 
+                               k = 5, 
+                               seed = 25, 
+                               save_path = NULL) {
+  if (!requireNamespace("impute", quietly = TRUE)) {
+    stop("Please install the 'impute' package.")
+  }
+  set.seed(seed)
+  time_taken <- system.time({
+    knn_result <- impute::impute.knn(as.matrix(df), k = k)
+    knn_df <- as.data.frame(knn_result$data)
+  })
+  if (!is.null(save_path)) {
+    save(knn_df, file = save_path)
+  }
+  print(time_taken)
+  return(list(
+    imputed_data = knn_df,
+    time = time_taken,
+    save_path = save_path
+  ))
+}
+
+run_knn <- function(data_list, 
+                    k = 5, 
+                    seed = 25, 
+                    save_dir = "./output_DDA", 
+                    prefix = "knn") {
+  if (!dir.exists(save_dir)) dir.create(save_dir, recursive = TRUE)
+  results <- list()
+  for (name in names(data_list)) {
+    cat("Running KNN imputation for:", name, "\n")
+    save_path <- file.path(save_dir, paste0(prefix, "_", name, ".Rdata"))
+    result <- run_knn_imputation(
+      df = data_list[[name]],
+      k = k,
+      seed = seed,
+      save_path = save_path
+    )
+    results[[name]] <- result
+  }
+  return(results)
+}
+
+run_rf_imputation <- function(df, 
+                              seed = 123, 
+                              save_path = NULL, 
+                              verbose = FALSE) {
+  if (!requireNamespace("missForest", quietly = TRUE)) {
+    stop("Please install the 'missForest' package.")
+  }
+  set.seed(seed)
+  time_taken <- system.time({
+    res <- missForest::missForest(as.data.frame(df), verbose = verbose)
+    imputed_df <- res$ximp
+  })
+  if (!is.null(save_path)) {
+    save(imputed_df, file = save_path)
+  }
+  print(time_taken)
+  return(list(
+    imputed_data = imputed_df,
+    time = time_taken,
+    save_path = save_path
+  ))
+}
+
+run_rf <- function(data_list, 
+                   seed = 123, 
+                   save_dir = "./output_DDA", 
+                   prefix = "rf", 
+                   verbose = FALSE) {
+  if (!dir.exists(save_dir)) dir.create(save_dir, recursive = TRUE)
+  results <- list()
+  for (name in names(data_list)) {
+    cat("Running missForest imputation for:", name, "\n")
+    save_path <- file.path(save_dir, paste0(prefix, "_", name, ".Rdata"))
+    result <- run_rf_imputation(
+      df = data_list[[name]],
+      seed = seed,
+      save_path = save_path,
+      verbose = verbose
+    )
+    results[[name]] <- result
+  }
+  return(results)
+}
+
+```
+### Hybrid Imputation Function
+```{r}
+run_hybrid_imputation <- function(df_norm,
+                                  df_filter,
+                                  q = 0.01, 
+                                  tune.sigma = 0.7, 
+                                  rf_seed = 123, 
+                                  minprob_seed = 25, 
+                                  save_path = NULL,
+                                  verbose = FALSE,
+                                  plot = TRUE) {
+  library(dplyr)
+  library(missForest)
+  library(imputeLCMD)
+  library(ggplot2)
+  library(scales)
+  miss_cor <- data.frame(
+    missing_rate   = rowSums(is.na(df_norm)) / ncol(df_norm),
+    mean_abundance = rowMeans(df_filter, na.rm = TRUE)
+  )
+  q3 <- quantile(miss_cor$missing_rate, 0.75, na.rm = TRUE)
+  skip_loess <- q3 == 0
+  if (skip_loess) {
+    message("Skipping loess and hybrid split because 75% of proteins have missing_rate = 0.")
+    set.seed(minprob_seed)
+    imp_all <- impute.MinProb(df_norm, q = q, tune.sigma = tune.sigma)
+
+    if (!is.null(save_path)) {
+      save(imp_all, file = save_path)
+    }
+    return(list(
+      imputed_data = imp_all,
+      time = NA,
+      elbow = NA,
+      save_path = save_path
+    ))
+  }
+  loess_fit <- loess(mean_abundance ~ missing_rate, data = miss_cor, span = 0.75)
+  x_vals <- seq(min(miss_cor$missing_rate), max(miss_cor$missing_rate), length.out = 1000)
+  y_vals <- predict(loess_fit, newdata = data.frame(missing_rate = x_vals))
+  x_start <- x_vals[1]; y_start <- y_vals[1]
+  x_end <- x_vals[length(x_vals)]; y_end <- y_vals[length(y_vals)]
+  line_vec <- c(x_end - x_start, y_end - y_start)
+  distances <- sapply(1:length(x_vals), function(i) {
+    point_vec <- c(x_vals[i] - x_start, y_vals[i] - y_start)
+    cross_prod <- abs(line_vec[1] * point_vec[2] - line_vec[2] * point_vec[1])
+    norm_line <- sqrt(sum(line_vec^2))
+    return(cross_prod / norm_line)
+  })
+  elbow_index <- which.max(distances)
+  elbow_x <- x_vals[elbow_index]
+  missing_rate <- rowSums(is.na(df_norm)) / ncol(df_norm)
+  genes_low  <- names(missing_rate)[missing_rate <= elbow_x]
+  genes_high <- names(missing_rate)[missing_rate >  elbow_x]
+  df_low  <- df_norm[genes_low, , drop = FALSE]
+  df_high <- df_norm[genes_high, , drop = FALSE]
+  time_taken <- system.time({
+    set.seed(minprob_seed)
+    imp_high <- impute.MinProb(df_high, q = q, tune.sigma = tune.sigma)
+    
+    df_combined <- df_norm
+    df_combined[rownames(imp_high), ] <- imp_high
+    
+    set.seed(rf_seed)
+    res_rf_full <- missForest(as.data.frame(df_combined), verbose = verbose)
+    imp_combo <- res_rf_full$ximp
+  })
+  if (!is.null(save_path)) {
+    save(imp_combo, file = save_path)
+  }
+  if (plot) {
+    ggplot(miss_cor, aes(x = missing_rate, y = mean_abundance)) +
+      geom_point(size = 0.7, alpha = 0.5) +
+      geom_smooth(method = "loess", se = FALSE, span = 0.75, color = "blue") +
+      geom_abline(
+        slope = (y_end - y_start) / (x_end - x_start),
+        intercept = y_start - ((y_end - y_start) / (x_end - x_start)) * x_start,
+        color = "gray50", linetype = "dashed"
+      ) +
+      geom_point(aes(x = elbow_x, y = y_vals[elbow_index]), color = "red", size = 2) +
+      geom_text(aes(x = elbow_x, y = y_vals[elbow_index] + 2,
+                    label = paste0("Elbow @ ", percent(elbow_x, accuracy = 1))), fontface = "bold" , size = 4.5, 
+                hjust = -0.2, vjust = -0.5, color = "red") +
+      scale_x_continuous(labels = percent_format(accuracy = 1)) +
+      theme_bw() +
+      theme(
+    panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+    text             = element_text(size = 13),
+    axis.text        = element_text(size = 13, face = "bold"),
+    axis.text.x      = element_text(color = "black", size = 13, face = "bold", angle = 45, hjust = 1),
+    axis.text.y      = element_text(color = "black", size = 13, face = "bold"), 
+    axis.ticks.length= unit(2, "mm"),
+    axis.title       = element_text(size = 14, face = "bold"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position  = "right",
+    legend.title     = element_text(size = 13, face = "bold"),
+    legend.text      = element_text(size = 12),
+    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15), 
+    strip.text       = element_text(size = 13, face = "bold") 
+  ) +
+      xlab("Missing Rate") +
+      ylab("Mean log2 Abundance") +
+      ggtitle("Loess-Based Elbow Point by Maximum Distance Method") %>%
+      print()
+  }
+  return(list(
+    imputed_data = imp_combo,
+    time = time_taken,
+    elbow = elbow_x,
+    save_path = save_path
+  ))
+}
+
+run_hybrid <- function(data_norm_list,
+                       data_filter_list,
+                       q = 0.01,
+                       tune.sigma = 0.7,
+                       rf_seed = 123,
+                       minprob_seed = 25,
+                       save_dir = "./data",
+                       prefix = "hybrid",
+                       verbose = FALSE,
+                       plot = TRUE) {
+  if (!dir.exists(save_dir)) dir.create(save_dir, recursive = TRUE)
+  results <- list()
+  for (name in names(data_norm_list)) {
+    cat("Running Hybrid Imputation for:", name, "\n")
+    save_path <- file.path(save_dir, paste0(prefix, "_", name, ".Rdata"))
+    result <- run_hybrid_imputation(
+      df_norm = data_norm_list[[name]],
+      df_filter = data_filter_list[[name]],
+      q = q,
+      tune.sigma = tune.sigma,
+      rf_seed = rf_seed,
+      minprob_seed = minprob_seed,
+      save_path = save_path,
+      verbose = verbose,
+      plot = plot
+    )
+    results[[name]] <- result
+  }
+  return(results)
+}
+```
+## Soft Hybrid Imputation Function
+```{r}
+soft_hybrid_impute <- function(df_rf, df_minProb, df_raw, 
+                               r0 = NULL, x0 = NULL, a = 10, b = 5, lambda = 0.5,
+                               visualize = TRUE, group_name = NULL,
+                               save_dir = "./SoftHybrid_DIA") {
+  stopifnot(all(dim(df_rf) == dim(df_minProb)))
+  stopifnot(all(rownames(df_rf) == rownames(df_minProb)))
+
+  missing_rate <- rowMeans(is.na(df_raw))
+  mean_intensity <- rowMeans(df_raw, na.rm = TRUE)
+  miss_cor <- data.frame(missing_rate = missing_rate, mean_abundance = mean_intensity)
+
+  q3 <- quantile(miss_cor$missing_rate, 0.75, na.rm = TRUE)
+  skip_loess <- q3 == 0
+
+  if (skip_loess) {
+    elbow_x <- 1 / ncol(df_raw)
+    candidates <- mean_intensity[round(missing_rate, 6) == round(elbow_x, 6)]
+    if (length(candidates) == 0) {
+      elbow_y <- mean(mean_intensity, na.rm = TRUE)  
+    } else {
+      elbow_y <- mean(candidates, na.rm = TRUE)
+    }
+  } else {
+    loess_fit <- loess(mean_abundance ~ missing_rate, data = miss_cor, span = 0.75)
+    x_vals <- seq(min(miss_cor$missing_rate), max(miss_cor$missing_rate), length.out = 1000)
+    y_vals <- predict(loess_fit, newdata = data.frame(missing_rate = x_vals))
+    x_start <- x_vals[1]; y_start <- y_vals[1]
+    x_end   <- x_vals[length(x_vals)]; y_end <- y_vals[length(y_vals)]
+    line_vec <- c(x_end - x_start, y_end - y_start)
+    distances <- sapply(1:length(x_vals), function(i) {
+      point_vec <- c(x_vals[i] - x_start, y_vals[i] - y_start)
+      cross_prod <- abs(line_vec[1] * point_vec[2] - line_vec[2] * point_vec[1])
+      norm_line <- sqrt(sum(line_vec^2))
+      return(cross_prod / norm_line)
+    })
+    max_index <- which.max(distances)
+    elbow_x <- x_vals[max_index]
+    elbow_y <- y_vals[max_index]
+  }
+  r0 <- elbow_x
+  x0 <- elbow_y
+  sigmoid <- function(x, k, x0) {
+    1 / (1 + exp(-k * (x - x0)))
+  }
+  sigmoid_r <- sigmoid(missing_rate, k = a, x0 = r0)
+  sigmoid_x <- sigmoid(mean_intensity, k = b, x0 = x0)
+  p_MNAR <- sigmoid_r * (1 - lambda * sigmoid_x)
+  df_imp_soft <- df_rf
+  for (i in seq_len(nrow(df_rf))) {
+    w <- 1 - p_MNAR[i]
+    df_imp_soft[i, ] <- w * df_rf[i, ] + (1 - w) * df_minProb[i, ]
+  }
+  if (visualize) {
+    library(ggplot2)
+    df_plot <- data.frame(
+      Protein = rownames(df_rf),
+      MissingRate = missing_rate,
+      MeanIntensity = mean_intensity,
+      Weight_RF = 1 - p_MNAR
+    )
+    p <- ggplot(df_plot, aes(x = MissingRate, y = MeanIntensity, color = Weight_RF)) +
+    geom_point(size = 1.6, alpha = 0.8) +
+    scale_color_gradient(low = "blue", high = "red", limits = c(0, 1)) +
+    scale_x_continuous(
+      limits = c(0, 1),
+      breaks = seq(0, 1, by = 0.25),
+      labels = percent_format(accuracy = 1)
+    ) +
+    scale_y_continuous(expand = expansion(mult = c(0.02, 0.05))) +
+    labs(
+      title = paste0("Soft Hybrid Weights (", group_name, ")"),
+      x = "Missing Rate",
+      y = "Mean Intensity",
+      color = "RF Weight"
+    ) +
+    theme(
+    panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+    text             = element_text(size = 13),
+    axis.text        = element_text(size = 13, face = "bold"),
+    axis.text.x      = element_text(color = "black", size = 13, face = "bold", angle = 45, hjust = 1),
+    axis.text.y      = element_text(color = "black", size = 13, face = "bold"), 
+    axis.ticks.length= unit(2, "mm"),
+    axis.title       = element_text(size = 14, face = "bold"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position  = "right",
+    legend.title     = element_text(size = 13, face = "bold"),
+    legend.text      = element_text(size = 12),
+    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15), 
+    strip.text       = element_text(size = 13, face = "bold") 
+  ) +
+    guides(color = guide_colorbar(
+      ticks = TRUE,
+      barheight = unit(48, "pt"),
+      frame.colour = "black"
+    ))
+    print(p)
+    if (!dir.exists(save_dir)) dir.create(save_dir)
+    save(p, file = paste0(save_dir, '/', group_name,"_SoftHybrid_plot.Rdata"))
+    ggsave(
+      filename = file.path(save_dir, paste0(group_name,"_SoftHybrid_plot.tiff")), 
+         plot = p, 
+         device = "tiff",
+         dpi = 300,
+         width = 6, 
+         height = 3.5,
+         units = "in"
+    )
+  }
+  return(df_imp_soft)
+}
+
+run_soft_hybrid_all_groups <- function(raw_list, rf_list, minProb_list,
+                                       lambda = 0.5, a = 10, b = 5, visualize = TRUE) {
+  group_names <- names(raw_list)
+  result_list <- list()
+  for (group in group_names) {
+    cat("Processing group:", group, "\n")
+    df_raw <- raw_list[[group]]
+    df_rf <- rf_list[[group]][['imputed_data']]
+    df_minProb <- minProb_list[[group]][['imputed_data']]
+    result <- soft_hybrid_impute(df_rf, df_minProb, df_raw,
+                                 a = a, b = b, lambda = lambda, visualize = visualize,
+                                 group_name = group)
+    result_list[[group]] <- result
+  }
+  return(result_list)
+}
+```
+
+
+# Data Preperation
+## Read Data
+```{r, warning=FALSE}
+intensity_50pg <- load_filtered_protein_matrix("./data/combined_protein_50pg.tsv")
+intensity_100pg <- load_filtered_protein_matrix("./data/combined_protein_100pg.tsv")
+intensity_1ng <- load_filtered_protein_matrix("./data/combined_protein_1ng.tsv")
+intensity_10ng <- load_filtered_protein_matrix("./data/combined_protein_10ng.tsv")
+```
+## Metadata Preparation
+```{r}
+metadata_50pg  <- extract_metadata_from_colnames(intensity_50pg)
+metadata_100pg <- extract_metadata_from_colnames(intensity_100pg)
+metadata_1ng   <- extract_metadata_from_colnames(intensity_1ng)
+metadata_10ng  <- extract_metadata_from_colnames(intensity_10ng)
+
+#colnames(intensity_50pg) <- unlist(lapply(strsplit(colnames(intensity_50pg), split = '_', fixed = TRUE), function(x) x[1]))
+#colnames(intensity_100pg) <- unlist(lapply(strsplit(colnames(intensity_100pg), split = '_', fixed = TRUE), function(x) x[1]))
+#colnames(intensity_1ng) <- unlist(lapply(strsplit(colnames(intensity_1ng), split = '_', fixed = TRUE), function(x) x[1]))
+#colnames(intensity_10ng) <- unlist(lapply(strsplit(colnames(intensity_10ng), split = '_', fixed = TRUE), function(x) x[1]))
+```
+## Wide to Long
+```{r}
+intensity_50pg_long <- reshape_intensity_long(intensity_50pg, metadata_50pg)
+intensity_100pg_long <- reshape_intensity_long(intensity_100pg, metadata_100pg)
+intensity_1ng_long <- reshape_intensity_long(intensity_1ng, metadata_1ng)
+intensity_10ng_long <- reshape_intensity_long(intensity_10ng, metadata_10ng)
+```
+## Missing Rate Calculation and Filtration
+```{r}
+df_50pg_filter <- filter_log2_matrix_by_missing_rate(intensity_50pg, intensity_50pg_long)
+df_100pg_filter <- filter_log2_matrix_by_missing_rate(intensity_100pg, intensity_100pg_long)
+df_1ng_filter <- filter_log2_matrix_by_missing_rate(intensity_1ng, intensity_1ng_long)
+df_10ng_filter <- filter_log2_matrix_by_missing_rate(intensity_10ng, intensity_10ng_long)
+```
+## Missing Rate Presentation
+```{r}
+p1 <- plot_group_missing_rate(intensity_50pg, intensity_50pg_long, metadata_50pg, label = "50pg_DDA")
+p2 <- plot_group_missing_rate(intensity_100pg, intensity_100pg_long, metadata_100pg, label = "100pg_DDA")
+p3 <- plot_group_missing_rate(intensity_1ng, intensity_1ng_long, metadata_1ng, label = "1ng_DDA")
+p4 <- plot_group_missing_rate(intensity_10ng, intensity_10ng_long, metadata_10ng, label = "10ng_DDA")
+
+p1
+p2
+p3
+p4
+
+pcombo <- (p1 | p2) / (p3 | p4) +   
+  plot_layout(guides = "collect") +
+  plot_annotation(tag_levels = 'A') &   
+  theme(
+    plot.tag = element_text(face = "bold", size = 14),
+    plot.tag.position = c(0.02, 0.98)         
+  )
+
+pcombo
+
+ggsave(
+  filename = "./figure/DDA_MissingRate_ThreeSpecies.tiff",
+  plot = pcombo,                      
+  device = "tiff",                    
+  dpi = 300,                          
+  width = 15,                        
+  height = 6,                       
+  units = "in"                      
+)
+```
+## Normalisation
+```{r}
+df_50pg_norm <- median_centering(df_50pg_filter)
+df_100pg_norm <- median_centering(df_100pg_filter)
+df_1ng_norm <- median_centering(df_1ng_filter)
+df_10ng_norm <- median_centering(df_10ng_filter)
+```
+
+# Data Imputation
+```{r}
+data_list <- list(
+  "50pg"  = df_50pg_norm,
+  "100pg" = df_100pg_norm,
+  "1ng"   = df_1ng_norm,
+  "10ng"  = df_10ng_norm
+)
+data_filter_list <- list(
+  "50pg"  = df_50pg_filter,
+  "100pg" = df_100pg_filter,
+  "1ng"   = df_1ng_filter,
+  "10ng"  = df_10ng_filter
+)
+```
+
+## Elbow Point Detection
+```{r}
+theme_pub <- function(base_size = 10, base_family = "Arial") {
+  ggplot2::theme_classic(base_size = base_size, base_family = base_family) %+replace%
+    ggplot2::theme(
+      panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+      axis.title       = element_text(size = base_size + 1, face = "bold"),
+      axis.text        = element_text(size = base_size),
+      axis.ticks.length= unit(2, "mm"),
+      plot.title       = element_text(size = base_size + 2, face = "bold", hjust = 0.5),
+      legend.position  = "right",
+      legend.title     = element_text(size = base_size),
+      legend.text      = element_text(size = base_size - 1)
+    )
+}
+
+find_missing_rate_elbow <- function(df_norm,
+                                    span = 0.75,
+                                    n_points = 1000,
+                                    point_size = 1.6,
+                                    point_alpha = 0.1,
+                                    save_path = NULL, 
+                                    group_name = NULL,
+                                    tiff_width = 8,  
+                                    tiff_height = 5,
+                                    tiff_dpi = 600) {
+  
+  stopifnot(is.matrix(df_norm) || is.data.frame(df_norm))
+  if (!requireNamespace("ggplot2", quietly = TRUE)) stop("Please install 'ggplot2'.")
+  if (!requireNamespace("scales", quietly = TRUE))  stop("Please install 'scales'.")
+  
+  df_norm <- as.matrix(df_norm)
+  
+  miss_cor <- data.frame(
+    missing_rate   = rowSums(is.na(df_norm)) / ncol(df_norm),
+    mean_abundance = rowMeans(df_norm, na.rm = TRUE)
+  )
+  
+  fit <- stats::loess(mean_abundance ~ missing_rate, data = miss_cor, span = span)
+  
+  x_vals <- seq(min(miss_cor$missing_rate, na.rm = TRUE),
+                max(miss_cor$missing_rate, na.rm = TRUE),
+                length.out = n_points)
+  y_vals <- stats::predict(fit, newdata = data.frame(missing_rate = x_vals))
+  
+  keep   <- !is.na(y_vals)
+  x_vals <- x_vals[keep]
+  y_vals <- y_vals[keep]
+  
+  x_start <- x_vals[1];              y_start <- y_vals[1]
+  x_end   <- x_vals[length(x_vals)]; y_end   <- y_vals[length(y_vals)]
+  line_vec  <- c(x_end - x_start, y_end - y_start)
+  norm_line <- sqrt(sum(line_vec^2))
+  distances <- vapply(seq_along(x_vals), function(i) {
+    point_vec <- c(x_vals[i] - x_start, y_vals[i] - y_start)
+    abs(line_vec[1] * point_vec[2] - line_vec[2] * point_vec[1]) / norm_line
+  }, numeric(1))
+  max_index <- which.max(distances)
+  elbow_x <- x_vals[max_index]
+  elbow_y <- y_vals[max_index]
+  
+  library(ggplot2)
+  library(scales)
+  
+  p <- ggplot(miss_cor, aes(x = missing_rate, y = mean_abundance)) +
+    geom_point(size = point_size, alpha = point_alpha) +
+    geom_smooth(method = "loess", se = FALSE, span = span) +
+    geom_abline(
+      slope = (y_end - y_start) / (x_end - x_start),
+      intercept = y_start - ((y_end - y_start) / (x_end - x_start)) * x_start,
+      linetype = "dashed"
+    ) +
+    annotate("point", x = elbow_x, y = elbow_y, colour = "red", size = 2) +
+    annotate("text",
+             x = elbow_x, y = elbow_y + 2,
+             label = paste0("Elbow @ ", scales::percent(elbow_x, accuracy = 1)),
+             hjust = -0.2, vjust = -0.5, colour = "red",
+             size = 4.5, fontface = "bold") +
+    scale_x_continuous(
+      limits = c(0, 1),
+      breaks = seq(0, 1, by = 0.25),
+      labels = scales::percent_format(accuracy = 1)
+    ) +
+    scale_y_continuous(
+      limits = c(-5,10),
+      breaks = seq(-5, 10, by = 2.5),
+      expand = expansion(mult = c(0.02, 0.05))) +
+    labs(
+      title = paste("Loess-Based Elbow Point by Maximum Distance Method:", group_name),
+      x = "Missing Rate",
+      y = "Mean log2 Abundance"
+    ) +
+    theme_bw() +
+    theme(
+    panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+    text             = element_text(size = 13),
+    axis.text        = element_text(size = 13, face = "bold"),
+    axis.text.x      = element_text(color = "black", size = 13, face = "bold"),
+    axis.text.y      = element_text(color = "black", size = 13, face = "bold"), 
+    axis.ticks.length= unit(2, "mm"),
+    axis.title       = element_text(size = 14, face = "bold"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position  = "right",
+    legend.title     = element_text(size = 13, face = "bold"),
+    legend.text      = element_text(size = 12),
+    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15), 
+    strip.text       = element_text(size = 13, face = "bold") 
+  )
+  
+  if (!is.null(save_path)) {
+    ggsave(filename = save_path, plot = p, device = "tiff",
+           dpi = tiff_dpi, width = tiff_width, height = tiff_height,
+           units = "in", compression = "lzw")
+  }
+  
+  list(
+    miss_cor = miss_cor,
+    fit = fit,
+    elbow = list(x = elbow_x, y = elbow_y),
+    plot = p
+  )
+}
+```
+
+```{r}
+res_50pg_DDA <- find_missing_rate_elbow(df_50pg_norm, span = 0.75,
+                                        group_name = 'DDA_50pg',
+                                        save_path = "./figure/DDA_50pg_elbow.tiff")
+res_100pg_DDA <- find_missing_rate_elbow(df_100pg_norm, span = 0.75,
+                                         group_name = 'DDA_100pg',
+                                         save_path = "./figure/DDA_100pg_elbow.tiff")
+res_1ng_DDA <- find_missing_rate_elbow(df_1ng_norm, span = 0.75,
+                                       group_name = 'DDA_1ng',
+                                       save_path = "./figure/DDA_1ng_elbow.tiff")
+res_10ng_DDA <- find_missing_rate_elbow(df_10ng_norm, span = 0.75,
+                                        group_name = 'DDA_10ng',
+                                        save_path = "./figure/DDA_10ng_elbow.tiff")
+save(res_50pg_DDA, file = './output/res_50pg_DDA.Rdata')
+save(res_100pg_DDA, file = './output/res_10pg_DDA.Rdata')
+save(res_1ng_DDA, file = './output/res_1ng_DDA.Rdata')
+save(res_10ng_DDA, file = './output/res_10ng_DDA.Rdata')
+```
+
+```{r}
+load(file = './output/res_50pg_DDA.Rdata')
+load(file = './output/res_10pg_DDA.Rdata')
+load(file = './output/res_1ng_DDA.Rdata')
+load(file = './output/res_50pg_DIA.Rdata')
+load(file = './output/res_100pg_DIA.Rdata')
+load(file = './output/res_1ng_DIA.Rdata')
+```
+
+```{r, warning=FALSE}
+pelbow_combo <-
+ (res_50pg_DIA$plot|res_100pg_DIA$plot|res_1ng_DIA$plot)  / (res_50pg_DDA$plot|res_100pg_DDA$plot|res_1ng_DDA$plot) +   
+  plot_layout(guides = "collect") +
+  plot_annotation(tag_levels = 'A') & 
+  theme(
+    plot.tag = element_text(face = "bold", size = 14),
+    plot.tag.position = c(0.02, 0.98)         
+  )
+
+ggsave(
+  filename = "./figure/Elbow_Combo.tiff",  
+  plot = pelbow_combo,                      
+  device =  'tiff',                    
+  dpi = 300,                          
+  width = 22,                         
+  height = 11,                        
+  units = "in"                        
+)
+pelbow_combo
+```
+
+
+## Imputation Method I: Minimal Probability of ALL proteins
+```{r}
+#minprob_results <- run_minprob(data_list)
+#save(minprob_results, file = './output_DDA/minprob_results.Rdata')
+load(file = './output_DDA/minprob_results.Rdata')
+```
+## Imputation Method II: Gaussian sample of ALL proteins
+```{r}
+#gaussian_results <- run_gaussian(data_list)
+#save(gaussian_results, file = './output_DDA/gaussian_results.Rdata')
+load(file = './output_DDA/gaussian_results.Rdata')
+```
+## Imputation Method III: KNN of ALL proteins
+```{r}
+#knn_results <- run_knn(data_list)
+#save(knn_results, file = './output_DDA/knn_results.Rdata')
+load(file = './output_DDA/knn_results.Rdata')
+```
+## Imputation Method IV: Random Forest of ALL proteins
+```{r}
+#rf_results <- run_rf(data_list)
+#save(rf_results, file = './output_DDA/rf_results.Rdata')
+load(file = './output_DDA/rf_results.Rdata')
+```
+## Imputation Method V: combination of RF and minProb
+```{r}
+#hybrid_results <- run_hybrid(data_list, data_filter_list)
+#save(hybrid_results, file = './output_DDA/hybrid_results.Rdata')
+load(file = './output_DDA/hybrid_results.Rdata')
+```
+# Soft Hybrid Imputation
+```{r}
+#imp_soft_list <- run_soft_hybrid_all_groups(data_list, rf_results, minprob_results,
+#                                            lambda = 0.5, a = 10, b = 5, visualize = TRUE)
+#softhybrid_results <- list()
+#softhybrid_results[['50pg']]$imputed_data <- imp_soft_list[['50pg']]
+#softhybrid_results[['100pg']]$imputed_data <- imp_soft_list[['100pg']]
+#softhybrid_results[['1ng']]$imputed_data <- imp_soft_list[['1ng']]
+#softhybrid_results[['10ng']]$imputed_data <- imp_soft_list[['10ng']]
+#save(softhybrid_results, file = './output_DDA/softhybrid_results.Rdata')
+load(file = './output_DDA/softhybrid_results.Rdata')
+```
+
+```{r}
+load(file = './SoftHybrid_DIA/10ng_SoftHybrid_plot.Rdata')
+pDIA_10ng_SH <- p
+load(file = './SoftHybrid_DIA/1ng_SoftHybrid_plot.Rdata')
+pDIA_1ng_SH <- p
+load(file = './SoftHybrid_DIA/100pg_SoftHybrid_plot.Rdata')
+pDIA_100pg_SH <- p
+load(file = './SoftHybrid_DIA/50pg_SoftHybrid_plot.Rdata')
+pDIA_50pg_SH <- p
+load(file = './SoftHybrid_DDA/10ng_SoftHybrid_plot.Rdata')
+pDDA_10ng_SH <- p
+load(file = './SoftHybrid_DDA/1ng_SoftHybrid_plot.Rdata')
+pDDA_1ng_SH <- p
+load(file = './SoftHybrid_DDA/100pg_SoftHybrid_plot.Rdata')
+pDDA_100pg_SH <- p
+load(file = './SoftHybrid_DDA/50pg_SoftHybrid_plot.Rdata')
+pDDA_50pg_SH <- p
+```
+
+```{r, warning=FALSE}
+pSH_combo <-
+  (pDIA_50pg_SH|pDIA_100pg_SH|pDIA_1ng_SH|pDIA_10ng_SH)/(pDDA_50pg_SH|pDDA_100pg_SH|pDDA_1ng_SH|pDDA_10ng_SH)+   
+  plot_layout(guides = "collect") +
+  plot_annotation(tag_levels = 'A') &   
+  theme(
+    plot.tag = element_text(face = "bold", size = 14),
+    plot.tag.position = c(0.02, 0.98)         
+  ) +
+    theme(
+    panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+    text             = element_text(size = 13),
+    axis.text        = element_text(size = 13, face = "bold"),
+    axis.text.x      = element_text(color = "black", size = 13, face = "bold"),
+    axis.text.y      = element_text(color = "black", size = 13, face = "bold"), 
+    axis.ticks.length= unit(2, "mm"),
+    axis.title       = element_text(size = 14, face = "bold"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position  = "right",
+    legend.title     = element_text(size = 13, face = "bold"),
+    legend.text      = element_text(size = 12),
+    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15), 
+    strip.text       = element_text(size = 13, face = "bold") 
+  )
+
+ggsave(
+  filename = "./figure/SH_Combo.tiff",  
+  plot = pSH_combo,                     
+  device = "tiff",                    
+  dpi = 300,                          
+  width = 18,                         
+  height = 9,                        
+  units = "in"                        
+)
+
+pSH_combo
+```
+
+# Accuracy Benchmarking
+```{r}
+plot_log2_ratio <- function(expr_mat, metadata, raw_data, title_prefix, save_dir = "./plots_DIA") {
+  groupA <- metadata$Sample[metadata$Group == "SampleA"]
+  groupB <- metadata$Sample[metadata$Group == "SampleB"]
+  mean_A <- rowMeans(expr_mat[, as.character(groupA)])
+  mean_B <- rowMeans(expr_mat[, as.character(groupB)])
+  intensity_B <- rowMeans(raw_data[, as.character(groupB)])
+  log2_ratio <- mean_A - mean_B
+  species <- rep(NA, nrow(expr_mat))
+  species[grepl("_HUMAN$", rownames(expr_mat))] <- "Human"
+  species[grepl("_YEAST$", rownames(expr_mat))] <- "Yeast"
+  species[grepl("_ECOLI$|_ECOBD$|_ECOL6$", rownames(expr_mat))] <- "Ecoli"
+  species[is.na(species)] <- "Other"
+  plot_df <- data.frame(
+    Protein = rownames(expr_mat),
+    Mean_B = intensity_B,
+    Log2_Ratio = log2_ratio,
+    Species = species
+  )
+  if (!dir.exists(save_dir)) dir.create(save_dir)
+  custom_colors <- c("Human" = "#1b9e77", "Yeast" = "#d95f02", "Ecoli" = "#7570b3", "Other" = "grey70")
+  p <- ggplot(plot_df, aes(x = Mean_B, y = Log2_Ratio, color = Species)) +
+    geom_point(size = 2, alpha = 0.6) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.5) +
+    geom_hline(yintercept = c(-2, 1), linetype = "dashed", color = "black", linewidth = 0.5) +
+    coord_cartesian(ylim = c(-3, 3), expand = FALSE) +
+    scale_color_manual(values = custom_colors) +
+    labs(
+      title = title_prefix,
+      x = "Log2(SampleB)",
+      y = "Log2(SampleA/SampleB)"
+    ) +
+    theme_bw() +
+    theme(
+    panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+    text             = element_text(size = 13),
+    axis.text        = element_text(size = 13, face = "bold"),
+    axis.text.x      = element_text(color = "black", size = 13, face = "bold"),
+    axis.text.y      = element_text(color = "black", size = 13, face = "bold"), 
+    axis.ticks.length= unit(2, "mm"),
+    axis.title       = element_text(size = 14, face = "bold"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position  = "right",
+    legend.title     = element_text(size = 13, face = "bold"),
+    legend.text      = element_text(size = 12),
+    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15), 
+    strip.text       = element_text(size = 13, face = "bold") 
+  )
+  ggsave(filename = file.path(save_dir, paste0(title_prefix, "_plot.tiff")), 
+         plot = p, 
+         device = "tiff",
+         dpi = 300,
+         width = 6, 
+         height = 5,
+         units = "in")
+  save(p, file = paste0(save_dir, '/', title_prefix, '.Rdata'))
+  return(plot_df)
+}
+```
+
+```{r}
+impute_methods <- c("minProb", "RF", "Gaussian", "KNN", 'SoftHybrid')
+doses <- c("50pg", "100pg", "1ng", "10ng")
+results_list <- list()
+results_list_raw <- list()
+```
+
+```{r}
+for (method in impute_methods) {
+  for (dose in doses) {
+    expr_mat <- get(paste0(tolower(method), "_results"))[[dose]]$imputed_data
+    raw_data <- get(paste0("df_", dose, "_filter"))
+    metadata <- get(paste0("metadata_", dose))
+    title_prefix <- paste0(method, "-", dose)
+    
+    res <- plot_log2_ratio(expr_mat, metadata, raw_data, title_prefix)
+    results_list[[title_prefix]] <- res
+  }
+}
+for (dose in doses) {
+    expr_mat <- get(paste0("df_", dose, "_filter"))
+    raw_data <- get(paste0("df_", dose, "_filter"))
+    metadata <- get(paste0("metadata_", dose))
+    title_prefix <- paste0("Raw_", dose)
+    
+    res <- plot_log2_ratio(expr_mat, metadata, raw_data, title_prefix)
+    results_list_raw[[title_prefix]] <- res
+}
+```
+
+```{r}
+save(results_list, file = './data/results_list_DDA.Rdata')
+save(results_list_raw, file = './data/results_list_raw_DDA.Rdata')
+```
+
+```{r}
+results_list_DDA <- results_list
+results_list_raw_DDA <- results_list_raw
+
+load(file = './data/results_list_DIA.Rdata')
+load(file = './data/results_list_raw_DIA.Rdata')
+```
+## ID number bar plot
+```{r}
+ID_50pg_raw_DIA <- sum(!is.na(results_list_raw$Raw_50pg$Log2_Ratio))
+ID_50pg_raw_DDA <- sum(!is.na(results_list_raw_DDA$Raw_50pg$Log2_Ratio))
+ID_100pg_raw_DIA <- sum(!is.na(results_list_raw$Raw_100pg$Log2_Ratio))
+ID_100pg_raw_DDA <- sum(!is.na(results_list_raw_DDA$Raw_100pg$Log2_Ratio))
+ID_1ng_raw_DIA <- sum(!is.na(results_list_raw$Raw_1ng$Log2_Ratio))
+ID_1ng_raw_DDA <- sum(!is.na(results_list_raw_DDA$Raw_1ng$Log2_Ratio))
+ID_10ng_raw_DIA <- sum(!is.na(results_list_raw$Raw_10ng$Log2_Ratio))
+ID_10ng_raw_DDA <- sum(!is.na(results_list_raw_DDA$Raw_10ng$Log2_Ratio))
+
+df_bar <- data.frame(
+  'Method' = c('DIA_raw_50pg', 'DIA_imputed_50pg', 'DDA_raw_50pg', 'DDA_imputed_50pg',
+               'DIA_raw_100pg', 'DIA_imputed_100pg', 'DDA_raw_100pg', 'DDA_imputed_100pg',
+               'DIA_raw_1ng', 'DIA_imputed_1ng', 'DDA_raw_1ng', 'DDA_imputed_1ng',
+               'DIA_raw_10ng', 'DIA_imputed_10ng', 'DDA_raw_10ng', 'DDA_imputed_10ng'),
+  'Protein_number' =c(
+    1117,2299,461,1060,
+    1713,3000,868,1532,
+    5192,7102,3130,4688,
+    8853,10598, 5117,7871)
+)
+
+df_plot <- df_bar %>%
+  mutate(
+    Mode = ifelse(str_detect(Method, "^DIA"), "DIA", "DDA"),
+    Status = ifelse(str_detect(Method, "imputed"), "Imputed", "Raw"),
+    Dose = str_extract(Method, "(50pg|100pg|1ng|10ng)")
+  )
+
+df_plot$Mode <- factor(df_plot$Mode, levels = c("DIA", "DDA"))
+df_plot$Dose <- factor(df_plot$Dose, levels = c('50pg','100pg','1ng', '10ng'))
+
+p <- ggplot(df_plot, aes(x = Mode, y = Protein_number, fill = Status)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8), width = 0.7) +
+  facet_wrap(~ Dose, nrow = 1, scales = "free_y") +
+  scale_fill_manual(values = c("Raw" = "#4DBBD5FF", "Imputed" = "#E64B35FF")) +
+  labs(
+    x = "",
+    y = "Protein Count",
+    fill = ""
+  ) +
+  theme_bw() +
+  theme(
+    strip.text = element_text(size = 13, face = "bold"),
+    axis.text.x = element_text(size = 12, face = "bold"),
+    axis.text.y = element_text(size = 12, face = "bold"),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.7),
+    legend.position = "right"
+  )
+
+p
+```
+
+
+```{r}
+results_plot <- list()
+for (method in impute_methods) {
+  for (dose in doses) {
+    title_prefix <- paste0('./plots_DDA/', method, "-", dose, '.Rdata')
+    load(file = title_prefix)
+    plot_prefix <- paste0(method, "-", dose)
+    results_plot[[plot_prefix]] <- p
+  }
+}
+results_plot_raw <- list()
+for (dose in doses) {
+    title_prefix <- paste0('./plots_DDA/', "Raw_", dose, '.Rdata')
+    load(file = title_prefix)
+    plot_prefix <- paste0("Raw_", dose)
+    results_plot_raw[[plot_prefix]] <- p
+}
+```
+
+```{r}
+pDDA_Species_Accuracy <- (results_plot_raw[[1]] | results_plot[[1]] | results_plot[[5]] | results_plot[[9]] | results_plot[[13]] | results_plot[[17]]) / (results_plot_raw[[2]] | results_plot[[2]] | results_plot[[6]] | results_plot[[10]] | results_plot[[14]] | results_plot[[18]]) / (results_plot_raw[[3]] | results_plot[[3]] | results_plot[[7]] | results_plot[[11]] | results_plot[[15]] | results_plot[[19]]) / (results_plot_raw[[4]] | results_plot[[4]] | results_plot[[8]] | results_plot[[12]] | results_plot[[16]] | results_plot[[20]]) +   
+  plot_layout(guides = "collect") +
+  plot_annotation(tag_levels = 'A') &  
+  theme(
+    plot.tag = element_text(face = "bold", size = 14),
+    plot.tag.position = c(0.02, 0.98)         
+  )+
+  theme(
+    panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+    text             = element_text(size = 13),
+    axis.text        = element_text(size = 13, face = "bold"),
+    axis.text.x      = element_text(color = "black", size = 13, face = "bold"),
+    axis.text.y      = element_text(color = "black", size = 13, face = "bold"), 
+    axis.ticks.length= unit(2, "mm"),
+    axis.title       = element_text(size = 14, face = "bold"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position  = "right",
+    legend.title     = element_text(size = 18, face = "bold"),
+    legend.text      = element_text(size = 16),
+    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15), 
+    strip.text       = element_text(size = 13, face = "bold")
+  )
+
+ggsave(
+  filename = "./figure/DDA_Species_Accuracy.tiff",  
+  plot = pDDA_Species_Accuracy,                      
+  device = "tiff",                    
+  dpi = 300,                         
+  width = 27,                         
+  height = 20,                       
+  units = "in"                        
+)
+```
+
+# RF, minProb and SoftHybrid
+```{r}
+pDDA_ThreeMethods_Accuracy <- (results_plot_raw[[2]] | results_plot[[18]]) / (results_plot[[2]]|results_plot[[6]])/(results_plot[[10]] |results_plot[[14]]) +
+    plot_layout(guides = "collect") +
+    plot_annotation(tag_levels = 'A') &  
+    theme(
+    panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+    text             = element_text(size = 13),
+    axis.text        = element_text(size = 13, face = "bold"),
+    axis.text.x      = element_text(color = "black", size = 13, face = "bold"),
+    axis.text.y      = element_text(color = "black", size = 13, face = "bold"), 
+    axis.ticks.length= unit(2, "mm"),
+    axis.title       = element_text(size = 14, face = "bold"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position  = "right",
+    legend.title     = element_text(size = 14, face = "bold"),
+    legend.text      = element_text(size = 13),
+    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15), 
+    strip.text       = element_text(size = 13, face = "bold") 
+  )
+pDDA_ThreeMethods_Accuracy
+
+ggsave(
+  filename = "./figure/DDA_ThreeMethods_Accuracy.tiff",  
+  plot = pDDA_ThreeMethods_Accuracy,                      
+  device = "tiff",                    
+  dpi = 300,                         
+  width = 8,                         
+  height = 10.5,                     
+  units = "in"                       
+)
+```
+
+```{r}
+ground_truth <- c("Ecoli" = -2, "Human" = 0, "Yeast" = 1)
+pointwise_error_df <- data.frame()
+for (name in names(results_list)) {
+  df <- results_list[[name]]
+  df <- df %>% filter(Species %in% names(ground_truth))
+  df$Truth <- ground_truth[df$Species]
+  df$Abs_Error <- abs(df$Log2_Ratio - df$Truth)
+  df$Squared_Error <- (df$Log2_Ratio - df$Truth)^2
+  df$Method <- name
+  pointwise_error_df <- rbind(pointwise_error_df, df)
+}
+
+methodwise_error_summary <- pointwise_error_df %>%
+  group_by(Method) %>%
+  summarise(
+    N = n(),
+    MAE = mean(Abs_Error, na.rm = TRUE),
+    RMSE = sqrt(mean(Squared_Error, na.rm = TRUE)),
+    MAE_sd = sd(Abs_Error, na.rm = TRUE),
+    se = MAE_sd/sqrt(N),
+    lo = MAE - 1.96*se, hi = MAE + 1.96*se, 
+    .groups="drop"
+  ) %>%
+  arrange(MAE)
+
+print(methodwise_error_summary)
+
+specieswise_error_summary <- pointwise_error_df %>%
+  group_by(Method, Species) %>%
+  summarise(
+    N = n(),
+    MAE = mean(Abs_Error, na.rm = TRUE),
+    RMSE = sqrt(mean(Squared_Error, na.rm = TRUE)),
+    MAE_sd = sd(Abs_Error, na.rm = TRUE),
+    MAE_sd = sd(Abs_Error, na.rm = TRUE),
+    se = MAE_sd/sqrt(N),
+    lo = MAE - 1.96*se, hi = MAE + 1.96*se, 
+    .groups="drop"
+  ) %>%
+  arrange(MAE)
+
+print(specieswise_error_summary)
+```
+
+```{r}
+methodwise_error_summary$Order <- c(21, 22, 11, 23, 24, 12, 13, 14, 31, 32, 33, 25, 41, 15, 42, 34, 43, 44, 35, 45)
+methodwise_error_summary <- methodwise_error_summary %>%
+  arrange(Order) %>%
+  mutate(Dose = unlist(lapply(strsplit(Method, split = '-', fixed = TRUE), function(x) x[2])))
+methodwise_error_summary <- cbind(methodwise_error_summary$Dose, methodwise_error_summary[,1:9])
+colnames(methodwise_error_summary)[1] <- 'Dose'
+methodwise_error_summary$Method <- unlist(lapply(strsplit(methodwise_error_summary$Method, split = '-', fixed = TRUE), function(x) x[1]))
+print(methodwise_error_summary)
+```
+
+#Stats Summary Plotting
+```{r}
+methodwise_error_summary$Sample <- paste0(methodwise_error_summary$Dose, '-', methodwise_error_summary$Method)
+methodwise_error_summary$Method <- factor(methodwise_error_summary$Method, levels = c('Gaussian', 'KNN', 'minProb', 'RF', 'SoftHybrid'))
+methodwise_error_summary$Dose <- factor(methodwise_error_summary$Dose, levels = c('50pg', '100pg', '1ng', '10ng'))
+
+my_colors <- c(
+  "Gaussian"   = "#E69F00", 
+  "KNN"        = "#56B4E9",  
+  "RF"         = "#009E73",  
+  "SoftHybrid" = "#9966CC",  
+  "minProb"    = "#D55E00"  
+)
+
+pMAE_DDA <- methodwise_error_summary %>%
+  ggplot(aes(x = Sample, y = MAE, fill = Method, group = Method)) +
+  geom_col() +
+  scale_fill_manual(values = my_colors) +
+  geom_errorbar(aes(ymin = pmax(lo, 0), ymax = hi),
+                width = 0.18, linewidth = 0.4, alpha = 0.8) +
+  geom_text(aes(label = sprintf("%.3f", MAE), 
+                y = hi + 0.02),  
+            size = 4,
+            fontface = "bold") +
+  facet_wrap(~Dose, ncol = 4, scales = "free_x") +
+  coord_cartesian(ylim = c(0, 0.68), clip = "off") +
+  labs(y = "MAE", caption = "Error bars = 95% CI") +
+  theme_bw() +
+  ggtitle("DDA Global MAE across Imputation Methods and Doses") +  
+  theme(
+    panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+    text             = element_text(size = 13),
+    axis.text        = element_text(size = 13, face = "bold"),
+    axis.text.x      = element_blank(),
+    axis.text.y      = element_text(color = "black", size = 13, face = "bold"), 
+    axis.ticks.length= unit(2, "mm"),
+    axis.title       = element_text(size = 14, face = "bold"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position  = "right",
+    legend.title     = element_text(size = 14, face = "bold"),
+    legend.text      = element_text(size = 13),
+    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15), 
+    strip.text       = element_text(size = 13, face = "bold")
+  )
+pMAE_DDA
+
+pRMSE_DDA <- methodwise_error_summary %>% 
+  ggplot(aes(x = Sample, y = RMSE, fill = Method)) +
+  geom_col() +
+  scale_fill_manual(values = my_colors) +
+  theme_bw() +
+  xlab(NULL) +
+  ylab("RMSE") +
+  facet_wrap(~Dose, ncol = 4, scales = "free_x") +
+  ggtitle("DDA GlobalRMSE across Imputation Methods and Doses") +  
+  theme(
+    panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+    text             = element_text(size = 13),
+    axis.text        = element_text(size = 13, face = "bold"),
+    axis.text.x      = element_blank(),
+    axis.text.y      = element_text(color = "black", size = 13, face = "bold"), 
+    axis.ticks.length= unit(2, "mm"),
+    axis.title       = element_text(size = 14, face = "bold"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position  = "right",
+    legend.title     = element_text(size = 14, face = "bold"),
+    legend.text      = element_text(size = 13),
+    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15), 
+    strip.text       = element_text(size = 13, face = "bold") 
+  )
+pRMSE_DDA
+
+save(pMAE_DDA, file = './output/pMAE_DDA.Rdata')
+
+ggsave(
+  filename = "./figure/MAE_DDA.tiff",  
+  plot = pMAE_DDA,                      
+  device = "tiff",                    
+  dpi = 300,                          
+  width = 10.5,                         
+  height = 6,                        
+  units = "in"                       
+)
+```
+
+```{r}
+specieswise_error_summary <- specieswise_error_summary %>%
+  mutate(Dose = unlist(lapply(strsplit(Method, split = '-', fixed = TRUE), function(x) x[2])))
+specieswise_error_summary$Sample <- specieswise_error_summary$Method
+specieswise_error_summary$Method <-  unlist(lapply(strsplit(specieswise_error_summary$Method, split = '-', fixed = TRUE), function(x) x[1]))
+
+specieswise_error_summary$Method <- factor(specieswise_error_summary$Method, levels = c('Gaussian', 'KNN', 'minProb', 'RF', 'SoftHybrid'))
+specieswise_error_summary$Species <- factor(specieswise_error_summary$Species, levels = c('Ecoli', 'Yeast', 'Human'))
+```
+
+```{r}
+pMAE_DDA_10ng <- specieswise_error_summary %>% 
+  filter(Dose == '10ng') %>%
+  ggplot(aes(x = Sample, y = MAE, fill = Method)) +
+  geom_col() +
+  scale_fill_manual(values = my_colors) +
+  geom_errorbar(aes(ymin = pmax(lo, 0), ymax = hi),
+                width = 0.18, linewidth = 0.4, alpha = 0.8) +
+  geom_text(aes(label = sprintf("%.3f", MAE), 
+                y = hi + 0.1), 
+            size = 4,
+            fontface = "bold") +
+  theme_bw() +
+  xlab(NULL) +
+  ylab("MAE") +
+  facet_wrap(~Species, ncol = 3, scales = "free_x") +
+  ggtitle("10ng MAE across Species and Imputation Methods") +  
+  scale_y_continuous(limits = c(0, 1.8)) +
+  theme(
+    panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+    text             = element_text(size = 13),
+    axis.text        = element_text(size = 13, face = "bold"),
+    axis.text.x      = element_blank(),
+    axis.text.y      = element_text(color = "black", size = 13, face = "bold"), 
+    axis.ticks.length= unit(2, "mm"),
+    axis.title       = element_text(size = 14, face = "bold"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position  = "right",
+    legend.title     = element_text(size = 14, face = "bold"),
+    legend.text      = element_text(size = 13),
+    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15), 
+    strip.text       = element_text(size = 13, face = "bold")
+  )
+pMAE_DDA_10ng
+
+pMAE_DDA_1ng <- specieswise_error_summary %>% 
+  filter(Dose == '1ng') %>%
+  ggplot(aes(x = Sample, y = MAE, fill = Method)) +
+  geom_col() +
+  scale_fill_manual(values = my_colors) +
+  geom_errorbar(aes(ymin = pmax(lo, 0), ymax = hi),
+                width = 0.18, linewidth = 0.4, alpha = 0.8) +
+  geom_text(aes(label = sprintf("%.3f", MAE), 
+                y = hi + 0.1),  
+            size = 4,
+            fontface = "bold") +
+  theme_bw() +
+  xlab(NULL) +
+  ylab("MAE") +
+  facet_wrap(~Species, ncol = 3, scales = "free_x") +
+  scale_y_continuous(limits = c(0, 1.8)) +
+  ggtitle("1ng MAE across Species and Imputation Methods") +  
+  theme(
+    panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+    text             = element_text(size = 13),
+    axis.text        = element_text(size = 13, face = "bold"),
+    axis.text.x      = element_blank(),
+    axis.text.y      = element_text(color = "black", size = 13, face = "bold"),
+    axis.ticks.length= unit(2, "mm"),
+    axis.title       = element_text(size = 14, face = "bold"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position  = "right",
+    legend.title     = element_text(size = 14, face = "bold"),
+    legend.text      = element_text(size = 13),
+    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15), 
+    strip.text       = element_text(size = 13, face = "bold")
+  )
+pMAE_DDA_1ng
+
+pMAE_DDA_100pg <- specieswise_error_summary %>% 
+  filter(Dose == '100pg') %>%
+  ggplot(aes(x = Sample, y = MAE, fill = Method)) +
+  geom_col() +
+  scale_fill_manual(values = my_colors) +
+  geom_errorbar(aes(ymin = pmax(lo, 0), ymax = hi),
+                width = 0.18, linewidth = 0.4, alpha = 0.8) +
+  geom_text(aes(label = sprintf("%.3f", MAE), 
+                y = hi + 0.1),  
+            size = 4,
+            fontface = "bold") +
+  theme_bw() +
+  xlab(NULL) +
+  ylab("MAE") +
+  facet_wrap(~Species, ncol = 3, scales = "free_x") +
+  ggtitle("100pg MAE across Species and Imputation Methods") +  
+  scale_y_continuous(limits = c(0, 1.8)) +
+  theme(
+    panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+    text             = element_text(size = 13),
+    axis.text        = element_text(size = 13, face = "bold"),
+    axis.text.x      = element_blank(),
+    axis.text.y      = element_text(color = "black", size = 13, face = "bold"), 
+    axis.ticks.length= unit(2, "mm"),
+    axis.title       = element_text(size = 14, face = "bold"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position  = "right",
+    legend.title     = element_text(size = 14, face = "bold"),
+    legend.text      = element_text(size = 13),
+    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15), 
+    strip.text       = element_text(size = 13, face = "bold") # facet名称
+  )
+pMAE_DDA_100pg
+
+pMAE_DDA_50pg <- specieswise_error_summary %>% 
+  filter(Dose == '50pg') %>%
+  ggplot(aes(x = Sample, y = MAE, fill = Method)) +
+  geom_col() +
+  scale_fill_manual(values = my_colors) +
+  geom_errorbar(aes(ymin = pmax(lo, 0), ymax = hi),
+                width = 0.18, linewidth = 0.4, alpha = 0.8) +
+  geom_text(aes(label = sprintf("%.3f", MAE), 
+                y = hi + 0.1),  
+            size = 4,
+            fontface = "bold") +
+  theme_bw() +
+  xlab(NULL) +
+  ylab("MAE") +
+  facet_wrap(~Species, ncol = 3, scales = "free_x") +
+  ggtitle("50pg MAE across Species and Imputation Methods") +  
+  scale_y_continuous(limits = c(0, 1.8)) +
+  theme(
+    panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+    text             = element_text(size = 13),
+    axis.text        = element_text(size = 13, face = "bold"),
+    axis.text.x      = element_blank(),
+    axis.text.y      = element_text(color = "black", size = 13, face = "bold"), 
+    axis.ticks.length= unit(2, "mm"),
+    axis.title       = element_text(size = 14, face = "bold"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position  = "right",
+    legend.title     = element_text(size = 14, face = "bold"),
+    legend.text      = element_text(size = 13),
+    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15), 
+    strip.text       = element_text(size = 13, face = "bold") 
+  )
+pMAE_DDA_50pg
+
+pDDA_Species_combo <- (pMAE_DDA_50pg | pMAE_DDA_100pg) / (pMAE_DDA_1ng | pMAE_DDA_10ng) +   
+  plot_layout(guides = "collect") +
+  plot_annotation(tag_levels = 'A') &   
+  theme(
+    plot.tag = element_text(face = "bold", size = 14),
+    plot.tag.position = c(0.02, 0.98)          
+  ) +
+  theme(
+    panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+    text             = element_text(size = 13),
+    axis.text        = element_text(size = 13, face = "bold"),
+    axis.text.x      = element_blank(),
+    axis.text.y      = element_text(color = "black", size = 13, face = "bold"), 
+    axis.ticks.length= unit(2, "mm"),
+    axis.title       = element_text(size = 14, face = "bold"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position  = "right",
+    legend.title     = element_text(size = 14, face = "bold"),
+    legend.text      = element_text(size = 13),
+    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15), 
+    strip.text       = element_text(size = 13, face = "bold") 
+  )
+
+pDDA_Species_combo
+
+ggsave(
+  filename = "./figure/DDA_MAE_ThreeSpecies.tiff",  
+  plot = pDDA_Species_combo,                      
+  device = "tiff",                    
+  dpi = 300,                         
+  width = 18,                         
+  height = 6,                        
+  units = "in"                        
+)
+```
+
+```{r}
+load(file = './output/pMAE_DIA.Rdata')
+load(file = './output/pMAE_DDA.Rdata')
+
+pMAE_combo <- pMAE_DIA / pMAE_DDA +   
+  plot_layout(guides = "collect") +
+  plot_annotation(tag_levels = 'A') &   
+  theme(
+    plot.tag = element_text(face = "bold", size = 14),
+    plot.tag.position = c(0.02, 0.98)         
+  )
+
+pMAE_combo
+
+ggsave(
+  filename = "./figure/MAE_Global_combo.tiff",  
+  plot = pMAE_combo,                      
+  device = "tiff",                    
+  dpi = 300,                          
+  width = 8,                        
+  height = 6,                        
+  units = "in"                      
+)
+
+ggsave(
+  filename = "./figure/MAE_DIA.tiff",  
+  plot = pMAE_DIA,                      
+  device = "tiff",                    
+  dpi = 300,                          
+  width = 15,                         
+  height = 6.5,                       
+  units = "in"                        
+)
+
+ggsave(
+  filename = "./figure/MAE_DDA.tiff",  
+  plot = pMAE_DDA,                      
+  device = "tiff",                   
+  dpi = 300,                          
+  width = 15,                         
+  height = 6.5,                        
+  units = "in"                        
+)
+```
+
+### Limma between Sample A and Sample B
+```{r}
+method_list <- list(
+  RF = rf_results,
+  minProb = minprob_results,
+  SoftHybrid = softhybrid_results,
+  KNN = knn_results,
+  Gaussian = gaussian_results,
+  metadata = list(
+    '50pg' = metadata_50pg,
+    '100pg' = metadata_100pg,
+    '1ng' = metadata_1ng,
+    '10ng' = metadata_10ng
+  )
+)
+```
+
+```{r}
+run_limma <- function(imputed_data, metadata, method_name, fc_threshold = 0, pval_threshold = 0.05) {
+  design <- model.matrix(~0 + Group, metadata)
+  colnames(design) <- c("SampleA", "SampleB")
+
+  fit1 <- lmFit(imputed_data, design = design, method = "robust", maxit = 2000)
+  contrast <- makeContrasts(SampleA - SampleB, levels = colnames(design))
+  fit2 <- contrasts.fit(fit1, contrast)
+  fit3 <- eBayes(fit2)
+
+  modtest <- limma::topTable(fit3, number = Inf, sort.by = "none")
+  limma_result <- merge(as.data.frame(imputed_data), as.data.frame(modtest), by = "row.names", all = TRUE)
+  rownames(limma_result) <- limma_result$Row.names
+  limma_result <- limma_result %>%
+    dplyr::select(-Row.names) %>%
+    arrange(adj.P.Val) %>%
+    mutate(gene = rownames(.))
+
+  sig_res <- limma_result %>%
+    filter(adj.P.Val < pval_threshold) %>%
+    arrange(adj.P.Val)
+
+  limma_result_upregulated <- sig_res %>% filter(logFC > fc_threshold)
+  limma_result_downregulated <- sig_res %>% filter(logFC < fc_threshold)
+
+  return(list(
+    method = method_name,
+    full_result = limma_result,
+    significant_DEGs = sig_res,
+    upregulated = limma_result_upregulated,
+    downregulated = limma_result_downregulated
+  ))
+}
+
+run_limma_all_groups <- function(method_list) {
+    results_list <- list()
+    Method_names <- names(method_list[1:5])
+    Dose_names <- names(method_list$metadata)
+    for (Method in Method_names) {
+      cat("Processing Method:", Method, "\n")
+        for (Dose in Dose_names) {
+                cat("-Processing Dose:", Dose, "\n")
+          imputed_data <- method_list[[Method]][[Dose]][["imputed_data"]]
+          metadata <- method_list$metadata[[Dose]]
+          method_name <- paste0(Method, '_', Dose)
+          result <- run_limma(imputed_data, metadata, method_name, fc_threshold = 0, pval_threshold = 0.05)
+          results_list[[method_name]] <- result
+        }
+    }
+    return(results_list)
+}
+```
+
+```{r}
+limma_res_list <- run_limma_all_groups(method_list)
+```
+```{r}
+extract_species <- function(rownms) {
+  sp <- str_extract(rownms, "(?<=_)HUMAN$|(?<=_)YEAST$|(?<=_)ECOBD$")
+  sp
+}
+
+species_to_truthdir <- function(sp) {
+  case_when(
+    sp == "YEAST" ~  1L,
+    sp == "ECOBD" ~ -1L,   
+    sp == "HUMAN" ~  0L,
+    TRUE ~ NA_integer_
+  )
+}
+
+call_dir_from_limma <- function(df, p_thresh = 0.05, fc_thresh = 0) {
+  case_when(
+    df$adj.P.Val < p_thresh & df$logFC >  fc_thresh ~  1L,
+    df$adj.P.Val < p_thresh & df$logFC <  fc_thresh ~ -1L,
+    TRUE ~ 0L
+  )
+}
+```
+
+```{r}
+evaluate_one <- function(limma_result_tbl, method_name) {
+  df <- limma_result_tbl$full_result %>%
+    dplyr::mutate(
+      species   = extract_species(rownames(.)),
+      truth_dir = species_to_truthdir(species),
+      call_dir  = call_dir_from_limma(., p_thresh = 0.05, fc_thresh = 0)
+    ) %>%
+    dplyr::filter(!is.na(t), !is.na(truth_dir))
+
+  TP_up <- sum(df$truth_dir ==  1 & df$call_dir ==  1)
+  FP_up <- sum(df$truth_dir !=  1 & df$call_dir ==  1)
+  FN_up <- sum(df$truth_dir ==  1 & df$call_dir !=  1)
+  TN_up <- sum(df$truth_dir !=  1 & df$call_dir !=  1)
+
+  TP_down <- sum(df$truth_dir == -1 & df$call_dir == -1)
+  FP_down <- sum(df$truth_dir != -1 & df$call_dir == -1)
+  FN_down <- sum(df$truth_dir == -1 & df$call_dir != -1)
+  TN_down <- sum(df$truth_dir != -1 & df$call_dir != -1)
+
+  TP_neu <- sum(df$truth_dir ==  0 & df$call_dir ==  0)
+  FP_neu <- sum(df$truth_dir !=  0 & df$call_dir ==  0)
+  FN_neu <- sum(df$truth_dir ==  0 & df$call_dir !=  0)
+  TN_neu <- sum(df$truth_dir !=  0 & df$call_dir !=  0)
+
+  conf_long <- dplyr::bind_rows(
+    tibble::tibble(MethodDose = method_name, Task = "Up(yeast)",   TP=TP_up,   FP=FP_up,   FN=FN_up,   TN=TN_up),
+    tibble::tibble(MethodDose = method_name, Task = "Down(ecoli)", TP=TP_down, FP=FP_down, FN=FN_down, TN=TN_down),
+    tibble::tibble(MethodDose = method_name, Task = "Neutral(human)", TP=TP_neu, FP=FP_neu, FN=FN_neu, TN=TN_neu)
+  ) %>%
+    dplyr::mutate(
+      Accuracy = (TP + TN) / (TP + FP + FN + TN),
+      Precision = TP / pmax(TP + FP, 1),
+      Recall = TP / pmax(TP + FN, 1),
+      F1 = 2 * Precision * Recall / pmax(Precision + Recall, 1e-9)
+    )
+
+  roc_up <- pROC::roc(response = (df$truth_dir == 1),
+                      predictor = df$t,
+                      levels = c(FALSE, TRUE),
+                      direction = "<",
+                      quiet = TRUE)
+  auc_up <- as.numeric(pROC::auc(roc_up))
+
+  roc_down <- pROC::roc(response = (df$truth_dir == -1),
+                        predictor = df$t,
+                        levels = c(FALSE, TRUE),
+                        direction = ">",
+                        quiet = TRUE)
+  auc_down <- as.numeric(pROC::auc(roc_down))
+
+  roc_neu <- pROC::roc(response = (df$truth_dir == 0),
+                       predictor = abs(df$t),
+                       levels = c(FALSE, TRUE),
+                       direction = ">",
+                       quiet = TRUE)
+  auc_neu <- as.numeric(pROC::auc(roc_neu))
+
+  macro_auc <- mean(c(auc_up, auc_down, auc_neu))
+
+  roc_df_up <- tibble::tibble(MethodDose = method_name, Task = "Up(yeast)",
+                              FPR = 1 - roc_up$specificities,  TPR = roc_up$sensitivities)
+  roc_df_down <- tibble::tibble(MethodDose = method_name, Task = "Down(ecoli)",
+                                FPR = 1 - roc_down$specificities, TPR = roc_down$sensitivities)
+  roc_df_neu <- tibble::tibble(MethodDose = method_name, Task = "Neutral(human)",
+                               FPR = 1 - roc_neu$specificities,  TPR = roc_neu$sensitivities)
+
+  auc_tbl <- tibble::tibble(
+    MethodDose = method_name,
+    Task = c("Up(yeast)", "Down(ecoli)", "Neutral(human)", "Macro"),
+    AUC  = c(auc_up, auc_down, auc_neu, macro_auc)
+  )
+
+  list(confusion = conf_long,
+       roc_curve = dplyr::bind_rows(roc_df_up, roc_df_down, roc_df_neu),
+       auc = auc_tbl)
+}
+```
+
+```{r}
+all_evals <- imap(limma_res_list, ~ evaluate_one(.x, .y))
+
+confusion_summary <- bind_rows(lapply(all_evals, `[[`, "confusion"))
+roc_curves_df     <- bind_rows(lapply(all_evals, `[[`, "roc_curve"))
+auc_summary       <- bind_rows(lapply(all_evals, `[[`, "auc"))
+
+split_md <- function(x) {
+  parts <- str_match(x, "^(.*?)_(50pg|100pg|1ng|10ng)$")
+  tibble(MethodDose = x, Method = parts[,2], Dose = parts[,3])
+}
+md_map <- split_md(unique(roc_curves_df$MethodDose))
+
+confusion_summary <- confusion_summary %>% left_join(md_map, by="MethodDose")
+roc_curves_df     <- roc_curves_df     %>% left_join(md_map, by="MethodDose")
+auc_summary       <- auc_summary       %>% left_join(md_map, by="MethodDose")
+```
+
+```{r}
+my_colors <- c(
+  "Gaussian"   = "#E69F00",
+  "KNN"        = "#56B4E9",
+  "RF"         = "#009E73",
+  "SoftHybrid" = "#9966CC",
+  "minProb"    = "#D55E00"
+)
+
+dose_lv   <- c("50pg","100pg","1ng","10ng")
+method_lv <- c("Gaussian","KNN","minProb","RF","SoftHybrid")
+roc_curves_df$Dose <- factor(roc_curves_df$Dose, levels = dose_lv)
+
+pROC <- ggplot(roc_curves_df, aes(x = FPR, y = TPR, color = Method)) +
+  geom_path(size = 0.8, alpha = 0.9) +
+  scale_color_manual(values = my_colors) +
+  facet_grid(Task ~ Dose) +
+  coord_equal() +
+  theme_bw() +
+  labs(title = "ROC Curves by Method and Dose: DDA",
+       subtitle = "Up task: Positive=Yeast (score=t); Down task: Positive=E. coli (score=-t)",
+       x = "False Positive Rate (1 - Specificity)",
+       y = "True Positive Rate (Sensitivity)") +
+  theme(
+    panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+    text             = element_text(size = 13),
+    axis.text        = element_text(size = 13, face = "bold"),
+    axis.text.x      = element_blank(),
+    axis.text.y      = element_blank(),
+    axis.ticks.length= unit(2, "mm"),
+    axis.title       = element_text(size = 14, face = "bold"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position  = "right",
+    legend.title     = element_text(size = 13, face = "bold"),
+    legend.text      = element_text(size = 12),
+    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15), 
+    strip.text       = element_text(size = 13, face = "bold") 
+  )
+
+pROC
+
+ggsave(
+  filename = "./figure/ROC_DDA.tiff",  
+  plot = pROC,                      
+  device = "tiff",                    
+  dpi = 300,                          
+  width = 8,                         
+  height = 8,                        
+  units = "in"                       
+)
+```
+
+
+```{r}
+dose_lv   <- c("50pg","100pg","1ng","10ng")
+method_lv <- c("Gaussian","KNN","minProb","RF","SoftHybrid")
+
+tasks_keep <- c("Up(yeast)", "Down(ecoli)", "Neutral(human)")
+
+fpr_grid <- seq(0, 1, length.out = 501)
+
+roc_interp <- roc_curves_df %>%
+  dplyr::filter(Task %in% tasks_keep) %>%
+  dplyr::arrange(MethodDose, Task, FPR) %>%
+  dplyr::group_by(MethodDose, Task) %>%
+  dplyr::group_modify(function(.x, .y) {
+    d <- .x %>% arrange(FPR, TPR)
+    x <- c(0, d$FPR, 1)
+    y <- c(0, d$TPR, 1)
+    tibble(FPR = fpr_grid,
+           TPR = approx(x = x, y = y, xout = fpr_grid, rule = 2, ties = "ordered")$y)
+  }) %>%
+  dplyr::ungroup()
+
+macro_interp <- roc_interp %>%
+  dplyr::group_by(MethodDose, FPR) %>%
+  dplyr::summarise(TPR_macro = mean(TPR, na.rm = TRUE), .groups = "drop") %>%
+  dplyr::left_join(md_map, by = "MethodDose") %>%
+  dplyr::mutate(
+    Dose   = factor(Dose,   levels = dose_lv),
+    Method = factor(Method, levels = method_lv)
+  )
+
+p_macroROC <- ggplot(macro_interp, aes(x = FPR, y = TPR_macro, color = Method)) +
+  geom_path(size = 0.9, alpha = 0.95) +
+  scale_color_manual(values = my_colors) +
+  facet_grid(. ~ Dose) +
+  coord_equal() +
+  theme_bw() +
+  labs(
+    title = "Macro ROC Curves by Method and Dose",
+    subtitle = "Macro = average TPR over Up(yeast), Down(ecoli), Neutral(human) at matched FPR",
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (macro-averaged)"
+  ) +
+  theme(
+    panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+    text             = element_text(size = 13),
+    axis.text        = element_text(size = 13, face = "bold", colour = "black"),
+    axis.ticks.length= unit(2, "mm"),
+    axis.title       = element_text(size = 14, face = "bold"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position  = "right",
+    legend.title     = element_text(size = 13, face = "bold"),
+    legend.text      = element_text(size = 12),
+    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15), 
+    strip.text       = element_text(size = 13, face = "bold") 
+  )
+
+p_macroROC
+
+ggsave(
+  filename = "./figure/macroROC_DDA.tiff",  
+  plot = p_macroROC,                      
+  device = "tiff",                    
+  dpi = 300,                         
+  width = 12,                         
+  height = 7,                        
+  units = "in"                       
+)
+```
+```{r}
+macro_auc <- macro_interp %>%
+  arrange(MethodDose, FPR) %>%
+  group_by(MethodDose, Dose, Method) %>%
+  summarise(
+    AUC = sum(diff(FPR) * zoo::rollmean(TPR_macro, 2), na.rm = TRUE),
+    .groups = "drop"
+  )
+best_by_dose <- macro_auc %>%
+  group_by(Dose) %>%
+  slice_max(AUC, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  mutate(is_best = TRUE) %>%
+  dplyr::select(Dose, Method, is_best)
+
+plot_df <- macro_interp %>%
+  left_join(best_by_dose, by = c("Dose","Method")) %>%
+  mutate(is_best = ifelse(is.na(is_best), FALSE, is_best))
+
+label_pos <- plot_df %>%
+  group_by(Dose, Method) %>%
+  arrange(FPR, .by_group = TRUE) %>
+  summarise(
+    TPR_macro = approx(
+      x = FPR,
+      y = TPR_macro,
+      xout = 0.20,
+      rule = 2,
+      ties = "ordered"
+    )$y %>% as.numeric(),
+    .groups = "drop"
+  ) %>%
+  mutate(FPR = 0.20) %>%
+  left_join(macro_auc, by = c("Dose","Method")) %>%
+  mutate(label = sprintf("%s: AUC=%.3f", as.character(Method), AUC))
+
+linetypes <- c(
+  Gaussian   = "solid",
+  KNN        = "dashed",
+  minProb    = "dotdash",
+  RF         = "twodash",
+  SoftHybrid = "solid"
+)
+
+labels_under_best <- macro_auc %>%
+  group_by(Dose) %>%
+  arrange(desc(AUC), .by_group = TRUE) %>%
+  mutate(
+    rank = row_number(),
+    x = 0.012,                        
+    y = 0.985 - 0.01 * rank,            
+    label = sprintf("%s: AUC=%.3f", as.character(Method), AUC)
+  ) %>%
+  ungroup()
+
+p_macroROC_zoom <-
+  ggplot(plot_df, aes(x = FPR, y = TPR_macro, color = Method, linetype = Method)) +
+  geom_path(aes(size = ifelse(is_best, 1.2, 0.8)), alpha = 0.95) +
+  scale_size_identity() +
+  scale_color_manual(values = my_colors) +
+  scale_linetype_manual(values = linetypes) +
+  facet_grid(. ~ Dose) +
+  coord_cartesian(xlim = c(0, 0.3), ylim = c(0.80, 1.00), expand = FALSE) +
+  theme_bw() +
+  labs(
+    title = "Macro ROC (Zoomed) by Method and Dose: DDA",
+    subtitle = "Macro = mean TPR over Up(yeast), Down(ecoli), Neutral(human) at matched FPR",
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (macro-averaged)"
+  ) +
+  theme(
+    text = element_text(size = 12),
+    axis.text = element_text(size = 10),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    legend.position = "right"
+  )
+  geom_text(
+    data = best_by_dose,
+    inherit.aes = FALSE,
+    aes(x = 0.005, y = 0.995, label = paste0("★ Best: ", Method)),
+    hjust = 0, vjust = 1, size = 3.6, fontface = "bold"
+  ) +
+  theme(
+    panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+    text             = element_text(size = 13),
+    axis.text        = element_text(size = 13, face = "bold", colour = "black"),
+    axis.ticks.length= unit(2, "mm"),
+    axis.title       = element_text(size = 14, face = "bold"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position  = "right",
+    legend.title     = element_text(size = 13, face = "bold"),
+    legend.text      = element_text(size = 12),
+    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15),
+    strip.text       = element_text(size = 13, face = "bold") 
+  )
+
+p_macroROC_zoom
+
+ggsave(
+  filename = "./figure/macroROC_zoom_DDA.tiff", 
+  plot = p_macroROC_zoom,                     
+  device = "tiff",                   
+  dpi = 300,                         
+  width = 12,                       
+  height = 4,                     
+  units = "in"                        
+)
+```
+
+```{r}
+df_numline <- auc_summary %>%
+  dplyr::filter(Task == "Macro") %>%
+  dplyr::select(MethodDose, AUC) %>%
+  dplyr::left_join(md_map, by = "MethodDose") %>%
+  dplyr::mutate(
+    Dose   = factor(Dose,   levels = c("50pg","100pg","1ng","10ng")),
+    Method = factor(Method, levels = c("Gaussian","KNN","minProb","RF","SoftHybrid")),
+    label  = paste0(as.character(Method), " (", sprintf("%.3f", AUC), ")")
+  ) %>%
+  dplyr::arrange(Dose, Method)
+
+p_numline <-
+  ggplot(df_numline, aes(x = AUC, y = 0, color = Method, shape = Method)) +
+  geom_hline(yintercept = 0, linewidth = 0.6, color = "grey35") +       
+  geom_point(size = 3) +
+  geom_point(aes(y = 0.02 * (as.numeric(Method) - 3)), size = 3) +
+  geom_text(aes(y = 0.02 * (as.numeric(Method) - 3), label = label),
+            nudge_y = 0.02, size = 3.3, hjust = 0, check_overlap = TRUE) +
+  geom_vline(xintercept = c(0.7, 0.8, 0.9), linetype = 3, linewidth = 0.3, color = "grey60") +
+  facet_grid(Dose ~ ., switch = "y") +
+  scale_x_continuous(limits = c(0.8, 1), breaks = seq(0.8, 1, 0.02), expand = expansion(mult = c(0.02, 0.10))) +
+  guides(color = "none", shape = "none") +
+  labs(x = "Mean-macro AUC (Up/Down/Neutral)", y = NULL,
+       title = "Number-line view of Mean-macro AUC by Dose",
+       subtitle = "Each point = a method; label shows Method (AUC)") +
+  theme_bw(base_size = 12) +
+  theme(
+    panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+    text             = element_text(size = 13),
+    axis.text        = element_text(size = 13, face = "bold", colour = "black"),
+    axis.ticks.length= unit(2, "mm"),
+    axis.title       = element_text(size = 14, face = "bold"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position  = "right",
+    legend.title     = element_text(size = 13, face = "bold"),
+    legend.text      = element_text(size = 12),
+    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15), 
+    strip.text       = element_text(size = 13, face = "bold") 
+  )
+p_numline
+
+```
+
+```{r}
+df_numline <- auc_summary %>%
+  filter(Task == "Macro") %>%
+  dplyr::select(MethodDose, AUC) %>%
+  left_join(md_map, by = "MethodDose") %>%
+  mutate(
+    Dose   = factor(Dose,   levels = c("50pg","100pg","1ng","10ng")),
+    Method = factor(Method, levels = c("Gaussian","KNN","minProb","RF","SoftHybrid"))
+  )
+
+shape_vec <- c(
+  "Gaussian"   = 15,  
+  "KNN"        = 3, 
+  "minProb"    = 18,  
+  "RF"         = 17, 
+  "SoftHybrid" = 16   
+)
+
+p_numline <-
+  ggplot(df_numline, aes(x = AUC, y = 0, color = Method, shape = Method)) +
+  geom_hline(yintercept = 0, linewidth = 0.6, color = "grey") +
+  geom_point(size = 3) +
+  scale_color_manual(values = my_colors) + 
+ # scale_shape_manual(values = shape_vec) +
+  facet_grid(Dose ~ ., switch = "y") +
+  scale_x_continuous(limits = c(0.9, 1),
+                     breaks = seq(0.9, 1, 0.02),
+                     expand = expansion(mult = c(0.02, 0.05))) +
+  labs(x = "Mean-macro AUC", y = NULL) +
+  theme_bw() +
+  theme(
+    strip.placement = "outside",
+    strip.text.y.left = element_text(angle = 0, face = "bold"),
+    axis.text.y  = element_blank(),
+    axis.ticks.y = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.spacing.y = unit(10, "pt"),
+    legend.position = "right",
+    panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+    text             = element_text(size = 13),
+    axis.text        = element_text(size = 13, face = "bold", colour = "black"),
+    axis.title       = element_text(size = 14, face = "bold"),
+    legend.title     = element_text(size = 13, face = "bold"),
+    legend.text      = element_text(size = 12),
+    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15), 
+    strip.text       = element_text(size = 13, face = "bold") 
+  )
+
+p_numline
+
+ggsave("./figure/mean_macro_numline_clean_DDA.tiff", 
+       p_numline, 
+       width = 12, 
+       height = 2, 
+       dpi = 300, 
+       device = "tiff")
+
+```
+

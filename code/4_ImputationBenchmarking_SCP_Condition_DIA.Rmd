@@ -1,0 +1,1029 @@
+---
+title: "4_ImputationBenchmarking_SCP_Condition_DIA"
+author: "Yixin Shi"
+date: "2025-07-20"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+pacman::p_load(magrittr, ggplot2, ggVennDiagram, pheatmap, ggridges, umap, limma, dplyr, tidyr, viridis, gridExtra, stringr, ggsci, clusterProfiler, org.Mm.eg.db, UpSetR, missForest,ComplexHeatmap, WGCNA, org.Hs.eg.db, GOSemSim, ggrepel, VennDiagram, GSVA, tibble, purrr, scales, imputeLCMD)
+```
+
+# Data Preperation
+## Read Data
+```{r, warning=FALSE}
+rm(list = ls())
+getwd()
+
+intensity <- read.csv("./data/report.unique_genes_matrix_con.tsv", sep = "\t", header = T)
+
+rownames(intensity) <- intensity$Genes
+intensity <- intensity[,-c(1,2,3)]
+sample <- unlist(lapply(strsplit(colnames(intensity), split = '_', fixed = TRUE), function(x) x[5]))
+group <- unlist(lapply(strsplit(colnames(intensity), split = '.', fixed = TRUE), function(x) x[8]))
+group <- unlist(lapply(strsplit(group, split = '_', fixed = TRUE), function(x) paste0(x[1], '_', x[2])))
+
+metadata <- data.frame(
+  Sample = sample,
+  Group = group
+)
+metadata$Sample[1:60] <- paste0(metadata$Sample[1:60],'_H')
+metadata$Sample[61:120] <- paste0(metadata$Sample[61:120],'_N')
+rownames(metadata) <- metadata$Sample
+colnames(intensity) <- metadata$Sample
+
+intensity <- cbind(intensity[,81:100], intensity[,c(61:80, 101:120)], intensity[, 21:40], intensity[,c(1:20,41:60)])
+metadata <- metadata[colnames(intensity),]
+
+filter_protein <- rownames(intensity)[!grepl("KRT", rownames(intensity))]
+filter_protein <- filter_protein[!filter_protein %in% c("CSTA", "CDSN", "CASP14", "HRNR", "CST6", "KPRP", "FLG2", "EVPL", "IVL", "PKP1")]
+intensity <- intensity[filter_protein,]
+```
+
+## Prepare Metadata File
+```{r, warning=FALSE}
+metadata$Condition <- unlist(lapply(strsplit(metadata$Group, split = '_', fixed = TRUE), function(x) x[1]))
+metadata$Type <- unlist(lapply(strsplit(metadata$Group, split = '_', fixed = TRUE), function(x) x[2]))
+metadata$Condition <- factor(metadata$Condition, levels = c('Normoxia', 'Hypoxia'))
+metadata$Type <- factor(metadata$Type, levels = c('GSC', 'AST', 'MAC'))
+metadata$ID <- apply(intensity, 2, function(x) sum(!is.na(x)))
+```
+
+
+## Data matrix manipulation
+```{r}
+df_long <- intensity %>% 
+  mutate(gene = rownames(.)) %>%
+  pivot_longer(cols = colnames(intensity), 
+               names_to = "sample", 
+               values_to = "intensity")
+df_long$group <- plyr::mapvalues(df_long$sample,
+                                       from = metadata$Sample,
+                                       to = metadata$Group)
+df_long$group <- factor(df_long$group, levels = c('Hypoxia_GSC', 'Hypoxia_AST', 'Hypoxia_MAC', 'Normoxia_GSC', 'Normoxia_AST', 'Normoxia_MAC'))
+df_long$sample <- factor(df_long$sample, levels = metadata$Sample)
+```
+
+
+## Filter expression profile in merged dataset
+```{r}
+### Manipulate data by log2
+df_log2 <- log2(intensity)
+df_long_log2 <- df_long
+df_long_log2$intensity <- log2(df_long_log2$intensity)
+### Regroup the matrix based on group and gene
+condition <- df_long %>%  
+  group_by(gene, group)%>%
+  reframe(sum(!is.na(intensity))) %>%
+  ungroup()
+colnames(condition) <- c('gene', 'group', 'nonna')
+
+metadata$Sample <- as.character(metadata$Sample)
+filter_sample <- metadata[metadata$ID >= 1000, "Sample"]
+metadata <- metadata[filter_sample,]
+```
+
+```{r}
+### Filter those gene which was detected in more than 75% replicates in at least one group
+geneName1 <- vector()
+for (i in unique(condition$gene)) {
+  if(any(condition[condition$gene == i,]$nonna>15)) {
+    geneName1 <- c(geneName1, i)
+    }
+}
+df_long_filter <- df_long_log2 %>%
+#  filter(gene %in% common_protein) %>%
+  filter(gene %in% geneName1) %>%
+  filter(sample %in% filter_sample)
+
+df_filter <- df_long_filter [,-4] %>%
+  pivot_wider(names_from = sample,
+              values_from = intensity) %>%
+  as.data.frame()
+rownames(df_filter )<- df_filter$gene
+df_filter <- df_filter[,-1]
+```
+
+##  Normlisation
+```{r}
+### Data normalization function
+median_centering <- function(df) {
+  df_norm <- as.data.frame(apply(df, 2, function(x) {
+                        gMedian = median(x, na.rm = TRUE)
+                        x - gMedian
+  }
+    ))
+  df_long_norm <- df_norm %>%
+    mutate(gene = rownames(.)) %>%
+    pivot_longer(cols = colnames(df_norm),
+                 names_to = 'sample',
+                 values_to = 'intensity')
+  df_long_norm$group <- plyr::mapvalues(df_long_norm$sample,
+                                        from = metadata$Sample,
+                                        to = metadata$Group)
+  df_long_norm$sample <- factor(df_long_norm$sample, levels = metadata$Sample)
+  
+  return(df_long_norm)
+}
+### Normalize data
+df_long_norm <- median_centering(df_filter)
+df_long_norm$group <- factor(df_long_norm$group, levels = c('Hypoxia_GSC', 'Hypoxia_AST', 'Hypoxia_MAC', 'Normoxia_GSC', 'Normoxia_AST', 'Normoxia_MAC'))
+
+df_norm <- df_long_norm %>% 
+  dplyr::select(-group) %>%
+  pivot_wider(names_from = sample, values_from = intensity) %>% 
+  as.data.frame()
+rownames(df_norm) <- df_norm$gene
+df_norm <- df_norm[,-1]
+```
+
+
+# Imputation
+## Imputation Method I: RF
+```{r}
+#set.seed(123)
+#res_all  <- missForest(as.data.frame(df_filter), verbose=FALSE)
+##imp_all  <- res_all$ximp
+#save(imp_all, file = './data_condition/imp_all_benchmarking.Rdata')
+load(file = './data_condition/imp_all_benchmarking.Rdata')
+```
+
+# Imputation Method II: Minimal Probability of ALL proteins
+```{r}
+#set.seed(25)
+#minProb_all <- impute.MinProb(
+#  df_filter,
+#  q = 0.01,
+#  tune.sigma = 0.7
+#)
+#save(minProb_all, file = './data_condition/minProb_all_benchmarking.Rdata')
+load(file = './data_condition/minProb_all_benchmarking.Rdata')
+```
+
+# Imputation Method III: combination of RF and minProb
+## Assessment of missing rate
+```{r}
+miss_cor <- data.frame(
+  missing_rate    = rowSums(is.na(df_filter)) / ncol(df_filter),
+  mean_abundance  = rowMeans(df_filter, na.rm = TRUE)
+)
+ggplot(miss_cor, aes(x = missing_rate, y = mean_abundance)) +
+  geom_point(size = 0.7, alpha = 0.6) +
+  geom_smooth(method = "loess", se = FALSE) +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  theme_bw() +
+  xlab("Missing Rate") +
+  ylab("Mean log2 Abundance") +
+  ggtitle("Correlation of Abundance and Missing Rate")
+
+#Elbow point: 1 missing sample
+```
+
+```{r}
+loess_fit <- loess(mean_abundance ~ missing_rate, data = miss_cor, span = 0.75)
+
+x_vals <- seq(min(miss_cor$missing_rate), max(miss_cor$missing_rate), length.out = 1000)
+y_vals <- predict(loess_fit, newdata = data.frame(missing_rate = x_vals))
+
+x_start <- x_vals[1]; y_start <- y_vals[1]
+x_end   <- x_vals[length(x_vals)]; y_end <- y_vals[length(y_vals)]
+line_vec <- c(x_end - x_start, y_end - y_start)
+
+distances <- sapply(1:length(x_vals), function(i) {
+  point_vec <- c(x_vals[i] - x_start, y_vals[i] - y_start)
+  cross_prod <- abs(line_vec[1] * point_vec[2] - line_vec[2] * point_vec[1])
+  norm_line <- sqrt(sum(line_vec^2))
+  return(cross_prod / norm_line)
+})
+
+max_index <- which.max(distances)
+elbow_x <- x_vals[max_index]
+elbow_y <- y_vals[max_index]
+
+ggplot(miss_cor, aes(x = missing_rate, y = mean_abundance)) +
+  geom_point(size = 0.7, alpha = 0.5) +
+  geom_smooth(method = "loess", se = FALSE, span = 0.75, color = "blue") +
+  geom_abline(
+    slope = (y_end - y_start) / (x_end - x_start),
+    intercept = y_start - ((y_end - y_start) / (x_end - x_start)) * x_start,
+    color = "gray50", linetype = "dashed"
+  ) +
+  geom_point(aes(x = elbow_x, y = elbow_y), color = "red", size = 2) +
+  geom_text(aes(x = elbow_x, y = elbow_y,
+                label = paste0("Elbow @ ", percent(elbow_x, accuracy = 1))),
+            hjust = -0.2, vjust = -0.5, color = "red") +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  theme_bw() +
+  xlab("Missing Rate") +
+  ylab("Mean log2 Abundance") +
+  ggtitle("Loess-Based Elbow Point by Maximum Distance Method")
+```
+
+## Imputation Method III:  Soft combination of RF and minProb at Elbow point
+```{r, warning=FALSE}
+#missing_rate <- rowSums(is.na(df_filter)) / ncol(df_filter)
+#thr <- 0.18
+#genes_low  <- names(missing_rate)[missing_rate <= thr]
+#genes_high <- names(missing_rate)[missing_rate >  thr]
+#df_low  <- df_filter[genes_low, , drop=FALSE]
+#df_high <- df_filter[genes_high, , drop=FALSE]
+
+#set.seed(123)
+#res_low  <- missForest(as.data.frame(df_low), verbose=FALSE)
+#imp_low  <- res_low$ximp
+#save(imp_low, file = './data_condition/imp_low_benchmarking.Rdata')
+#load(file = './data_condition/imp_low_benchmarking.Rdata')
+
+#set.seed(25)
+#imp_high <- impute.MinProb(
+#  df_high,
+#  q = 0.01,
+#  tune.sigma = 0.7
+#)
+#imp_combo <- rbind(imp_low, imp_high)
+#save(imp_combo, file = './data_condition/imp_combo_benchmarking.Rdata')
+load(file = './data_condition/imp_combo_benchmarking.Rdata')
+```
+
+# Imputation Method IV: KNN of ALL proteins
+```{r}
+#set.seed(25)
+#knn_impute <- impute.knn(as.matrix(df_filter), k = 5)
+#knn_all <- as.data.frame(knn_impute[[1]])
+#save(knn_all, file = './data_condition/knn_all_benchmarking.Rdata')
+load(file = './data_condition/knn_all_benchmarking.Rdata')
+```
+
+# Imputation Method V: gaussian sampling impute of ALL proteins
+```{r}
+#set.seed(25)
+
+#gaussian_impute <- function(df, width = 0.3, downshift = 1.8) {
+#  imputed_df <- df
+#  all_values <- unlist(df)
+#  observed_values <- all_values[!is.na(all_values)]
+#  
+#  mu <- mean(observed_values, na.rm = TRUE)
+#  sigma <- sd(observed_values, na.rm = TRUE)
+#  
+#  impute_mean <- mu - downshift * sigma
+#  impute_sd <- sigma * width
+  
+#  for (i in 1:nrow(df)) {
+#    for (j in 1:ncol(df)) {
+#      if (is.na(df[i, j])) {
+#        imputed_df[i, j] <- rnorm(1, mean = impute_mean, sd = impute_sd)
+#      }
+#    }
+#  }
+#  return(imputed_df)
+#}
+
+#GS_all <- gaussian_impute(df_filter)
+
+#save(GS_all, file = './data_condition/GS_all_benchmarking.Rdata')
+load(file = './data_condition/GS_all_benchmarking.Rdata')
+```
+
+# Imputation Method VI: Soft Hybrid Imputation
+```{r}
+soft_hybrid_impute <- function(df_rf, df_minProb, df_raw, 
+                               r0 = NULL, x0 = NULL, a = 10, b = 5, lambda = 0.5,
+                               visualize = TRUE) {
+  stopifnot(all(dim(df_rf) == dim(df_minProb)))
+  stopifnot(all(rownames(df_rf) == rownames(df_minProb)))
+
+  missing_rate <- rowMeans(is.na(df_raw))
+  mean_intensity <- rowMeans(df_raw, na.rm = TRUE)
+  r0 <- elbow_x
+  x0 <- elbow_y
+
+  sigmoid <- function(x, k, x0) {
+    1 / (1 + exp(-k * (x - x0)))
+  }
+  sigmoid_r <- sigmoid(missing_rate, k = a, x0 = r0)
+  sigmoid_x <- sigmoid(mean_intensity, k = b, x0 = x0)
+  p_MNAR <- sigmoid_r * (1 - lambda * sigmoid_x)
+
+  df_imp_soft <- df_rf
+  for (i in seq_len(nrow(df_rf))) {
+    w <- 1 - p_MNAR[i]  
+    df_imp_soft[i, ] <- w * df_rf[i, ] + (1 - w) * df_minProb[i, ]
+  }
+
+  if (visualize) {
+    library(ggplot2)
+    df_plot <- data.frame(
+      Protein = rownames(df_rf),
+      MissingRate = missing_rate,
+      MeanIntensity = mean_intensity,
+      Weight_RF = 1 - p_MNAR
+    )
+    theme_pub <- function(base_size = 10, base_family = "Arial") {
+              ggplot2::theme_classic(base_size = base_size, base_family = base_family) %+replace%
+                ggplot2::theme(
+                  panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+                  axis.title       = element_text(size = base_size + 1, face = "bold"),
+                  axis.text        = element_text(size = base_size),
+                  axis.ticks.length= unit(2, "mm"),
+                  plot.title       = element_text(size = base_size + 2, face = "bold", hjust = 0.5),
+                  legend.position  = "right",
+                  legend.title     = element_text(size = base_size),
+                  legend.text      = element_text(size = base_size - 1)
+                )
+            }
+     p <- ggplot(df_plot, aes(x = MissingRate, y = MeanIntensity, color = Weight_RF)) +
+        geom_point(size = 0.8, alpha = 0.8) +
+        scale_color_gradient(low = "blue", high = "red") +
+    scale_x_continuous(
+      limits = c(0, 1),
+      breaks = seq(0, 1, by = 0.25),
+      labels = scales::percent_format(accuracy = 1)
+    ) +
+    scale_y_continuous(expand = expansion(mult = c(0.02, 0.05))) +
+    labs(
+      title = paste("Soft Hybrid Weights"),
+      x = "Missing Rate",
+      y = "Mean log2 Abundance"
+    ) +
+    theme_pub(base_size = 10, base_family = "Arial")
+    print(p)
+    ggsave(
+      filename = './figure_benchmarking/plot_SH_Con.tiff', 
+         plot = p, 
+         device = "tiff",
+         dpi = 300,
+         width = 6, 
+         height = 3.5,
+         units = "in"
+    )
+     }
+  return(df_imp_soft)
+}
+```
+
+```{r}
+#df_imp_soft <- soft_hybrid_impute(imp_all, minProb_all, df_filter, lambda = 0.5)
+#save(df_imp_soft, file = './data_condition/SoftHybridImputation_benchmarking.Rdata')
+load(file = './data_condition/SoftHybridImputation_benchmarking.Rdata')
+```
+
+```{r}
+#imp <- soft_hybrid_impute(imp_all, minProb_all, df_filter, visualize = TRUE)
+```
+
+
+# Limma Comaprison
+## Run in the same batch
+```{r}
+run_limma <- function(imputed_data, metadata, method_name, fc_threshold = 1.5, pval_threshold = 0.05) {
+  design <- model.matrix(~0 + Condition, metadata)
+  colnames(design) <- c("Normoxia", "Hypoxia")
+
+  fit1 <- lmFit(imputed_data, design = design, method = "robust", maxit = 2000)
+  contrast <- makeContrasts(Hypoxia - Normoxia, levels = colnames(design))
+  fit2 <- contrasts.fit(fit1, contrast)
+  fit3 <- eBayes(fit2)
+
+  modtest <- limma::topTable(fit3, number = Inf, sort.by = "none")
+  limma_result <- merge(as.data.frame(imputed_data), as.data.frame(modtest), by = "row.names", all = TRUE)
+  rownames(limma_result) <- limma_result$Row.names
+  limma_result <- limma_result %>%
+    dplyr::select(-Row.names) %>%
+    arrange(adj.P.Val) %>%
+    mutate(gene = rownames(.))
+  sig_res <- limma_result %>%
+    filter(adj.P.Val < pval_threshold, AveExpr > 0) %>%
+    arrange(adj.P.Val)
+  mapID <- as.data.frame(mapIds(org.Hs.eg.db, sig_res$gene, 'ENTREZID', 'SYMBOL'))
+  colnames(mapID) <- c('ENTREZID')
+  mapID <- mapID %>% mutate(SYMBOL = rownames(.))
+  sig_res$ENTREZID <- mapID$ENTREZID
+  fold_change <- sig_res$logFC
+  names(fold_change) <- sig_res$gene
+
+  top_markers_FC_up <- sort(fold_change, decreasing = TRUE)
+  top_markers_FC_down <- sort(fold_change, decreasing = FALSE)
+
+  pvalue <- sig_res$adj.P.Val
+  names(pvalue) <- sig_res$gene
+  top_markers_p <- sort(pvalue, decreasing = FALSE)
+  limma_result_upregulated <- sig_res %>% filter(logFC > fc_threshold)
+
+  return(list(
+    method = method_name,
+    full_result = limma_result,
+    significant_DEGs = sig_res,
+    top_up = top_markers_FC_up,
+    top_down = top_markers_FC_down,
+    top_p = top_markers_p,
+    upregulated = limma_result_upregulated
+  ))
+}
+```
+
+```{r}
+results_list <- list(
+  RF = run_limma(imp_all, metadata, "RF"),
+  minProb = run_limma(minProb_all, metadata, "minProb"),
+  SoftHybrid = run_limma(df_imp_soft, metadata, "SoftHybrid"),
+  KNN = run_limma(knn_all, metadata, "KNN"),
+  Gaussian = run_limma(GS_all, metadata, "Gaussian")
+)
+```
+
+```{r}
+run_enrichment <- function(up_df, orgdb = org.Hs.eg.db, show_n = 10) {
+  hypoxia_uplist <- up_df$gene
+  gene_df <- bitr(hypoxia_uplist, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = orgdb)
+  entrez_ids <- gene_df$ENTREZID
+
+  if (length(entrez_ids) < 5) {
+    warning("Too few ENTREZ IDs for enrichment.")
+    return(list(KEGG = NULL, Reactome = NULL, GO = NULL))
+  }
+
+  # KEGG
+  kegg_res <- tryCatch(
+    enrichKEGG(gene = entrez_ids, organism = 'hsa'),
+    error = function(e) NULL
+  )
+  
+  # Reactome
+  reactome_res <- tryCatch(
+    enrichPathway(gene = entrez_ids, organism = 'human'),
+    error = function(e) NULL
+  )
+
+  # GO
+  go_res <- tryCatch(
+    enrichGO(gene = entrez_ids, OrgDb = orgdb, keyType = "ENTREZID", ont = "BP",
+             pAdjustMethod = "BH", pvalueCutoff = 0.05),
+    error = function(e) NULL
+  )
+
+  return(list(
+    KEGG = kegg_res,
+    Reactome = reactome_res,
+    GO = go_res
+  ))
+}
+```
+
+```{r, warning=FALSE}
+enrichment_results <- lapply(results_list, function(res) {
+  run_enrichment(res$upregulated)
+})
+
+```
+
+```{r}
+#dotplot(enrichment_results$RF$GO, showCategory = 10, title = "RF - GO Enrichment")
+dotplot(enrichment_results$minProb$GO, showCategory = 10, title = "minProb - GO Enrichment")
+#dotplot(enrichment_results$SoftHybrid$GO, showCategory = 10, title = "SoftHybrid - GO Enrichment")
+#dotplot(enrichment_results$KNN$GO, showCategory = 10, title = "KNN - GO Enrichment")
+dotplot(enrichment_results$Gaussian$GO, showCategory = 10, title = "Gaussian - GO Enrichment")
+
+```
+
+
+```{r}
+#dotplot(enrichment_results$RF$KEGG, showCategory = 10, title = "RF - KEGG Enrichment")
+#dotplot(enrichment_results$minProb$KEGG, showCategory = 10, title = "minProb - KEGG Enrichment")
+#dotplot(enrichment_results$SoftHybrid$KEGG, showCategory = 10, title = "SoftHybrid - KEGG Enrichment")
+dotplot(enrichment_results$KNN$KEGG, showCategory = 10, title = "KNN - KEGG Enrichment")
+dotplot(enrichment_results$Gaussian$KEGG, showCategory = 10, title = "Gaussian - KEGG Enrichment")
+```
+
+```{r}
+hallmarks <- read.gmt('./resource/h.all.v2023.2.Hs.symbols.gmt')
+
+run_gsea_hallmark <- function(limma_df, method_name = "") {
+  gene_df <- limma_df %>%
+    dplyr::select(gene, logFC) %>%
+    filter(!is.na(gene), !is.na(logFC))
+  gene_map <- bitr(gene_df$gene, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+  gene_df <- merge(gene_df, gene_map, by.x = "gene", by.y = "SYMBOL") %>%
+    distinct(ENTREZID, .keep_all = TRUE)
+
+  geneList <- gene_df$logFC
+  names(geneList) <- gene_df$gene
+  geneList <- sort(geneList, decreasing = TRUE)
+
+  if (length(geneList) < 10) {
+    warning(paste("Too few genes for GSEA:", method_name))
+    return(NULL)
+  }
+
+  gsea_res <- tryCatch({
+    GSEA(geneList, TERM2GENE = hallmarks, pvalueCutoff = 0.25)
+  }, error = function(e) NULL)
+
+  return(gsea_res)
+}
+
+
+```
+
+```{r, warning=FALSE}
+set.seed(123)
+gsea_results <- lapply(names(results_list), function(m) {
+  run_gsea_hallmark(results_list[[m]]$full_result, method_name = m)
+})
+names(gsea_results) <- names(results_list)
+```
+
+```{r}
+pRF <- dotplot(gsea_results$RF,
+        showCategory = 20,
+        label_format = 60,
+        split = ".sign") +
+  facet_grid(~.sign) +
+  ggtitle("GSEA - RF") +
+  coord_cartesian(xlim = c(0, 0.55), clip = "off") +
+  scale_color_gradient2(
+    high = "#4575b4", mid = "white", low = "#d73027", midpoint = 0.1,
+    name = "p.adjust",
+    guide = guide_colorbar(order = 1)
+  ) +
+  scale_size_continuous(
+    name = "Count",
+    guide = guide_legend(order = 2)
+  ) +
+  guides(
+      colour = guide_colorbar(order = 1),
+      size   = guide_legend(order = 2)
+    ) +
+  theme(
+    panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+    text             = element_text(size = 13),
+    axis.text        = element_text(size = 13, face = "bold"),
+    axis.text.x      = element_text(color = "black", size = 13, face = "bold"),
+    axis.text.y      = element_text(color = "black", size = 13, face = "bold"), # y轴文字
+    axis.ticks.length= unit(2, "mm"),
+    axis.title       = element_text(size = 14, face = "bold"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position  = "right",
+    legend.title     = element_text(size = 13, face = "bold"),
+    legend.text      = element_text(size = 12),
+    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15), # 标题居中、加粗
+    strip.text       = element_text(size = 13, face = "bold") # facet名称
+  )
+pRF
+
+pMP <- dotplot(gsea_results$minProb,
+        showCategory = 20,
+        label_format = 60,
+        split = ".sign") +
+  facet_grid(~.sign) +
+  ggtitle("GSEA - minProb") +
+  coord_cartesian(xlim = c(0, 0.55), clip = "off") +
+  scale_color_gradient2(
+    high = "#4575b4", mid = "white", low = "#d73027", midpoint = 0.1,
+    name = "p.adjust",
+    guide = guide_colorbar(order = 1)
+  ) +
+  scale_size_continuous(
+    name = "Count",
+    guide = guide_legend(order = 2)
+  ) +
+  guides(
+      colour = guide_colorbar(order = 1),
+      size   = guide_legend(order = 2)
+    ) +
+  theme(
+    panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+    text             = element_text(size = 13),
+    axis.text        = element_text(size = 13, face = "bold"),
+    axis.text.x      = element_text(color = "black", size = 13, face = "bold"),
+    axis.text.y      = element_text(color = "black", size = 13, face = "bold"), # y轴文字
+    axis.ticks.length= unit(2, "mm"),
+    axis.title       = element_text(size = 14, face = "bold"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position  = "right",
+    legend.title     = element_text(size = 13, face = "bold"),
+    legend.text      = element_text(size = 12),
+    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15), # 标题居中、加粗
+    strip.text       = element_text(size = 13, face = "bold") # facet名称
+  )
+pMP
+
+pSH <- dotplot(gsea_results$SoftHybrid,
+        showCategory = 20,
+        label_format = 60,
+        split = ".sign") +
+  facet_grid(~.sign) +
+  ggtitle("GSEA - SoftHybrid") +
+  coord_cartesian(xlim = c(0, 0.55), clip = "off") +
+  scale_color_gradient2(
+    high = "#4575b4", mid = "white", low = "#d73027", midpoint = 0.1,
+    name = "p.adjust",
+    guide = guide_colorbar(order = 1)
+  ) +
+  scale_size_continuous(
+    name = "Count",
+    guide = guide_legend(order = 2)
+  ) +
+  guides(
+      colour = guide_colorbar(order = 1),
+      size   = guide_legend(order = 2)
+    ) +
+  theme(
+    panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+    text             = element_text(size = 13),
+    axis.text        = element_text(size = 13, face = "bold"),
+    axis.text.x      = element_text(color = "black", size = 13, face = "bold"),
+    axis.text.y      = element_text(color = "black", size = 13, face = "bold"), # y轴文字
+    axis.ticks.length= unit(2, "mm"),
+    axis.title       = element_text(size = 14, face = "bold"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position  = "right",
+    legend.title     = element_text(size = 13, face = "bold"),
+    legend.text      = element_text(size = 12),
+    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15), # 标题居中、加粗
+    strip.text       = element_text(size = 13, face = "bold") # facet名称
+  )
+pSH
+
+pKNN <- dotplot(gsea_results$KNN,
+        showCategory = 20,
+        label_format = 60,
+        split = ".sign") +
+  facet_grid(~.sign) +
+  ggtitle("GSEA - KNN") +
+  coord_cartesian(xlim = c(0, 0.55), clip = "off") +
+  scale_color_gradient2(
+    high = "#4575b4", mid = "white", low = "#d73027", midpoint = 0.1,
+    name = "p.adjust",
+    guide = guide_colorbar(order = 1)
+  ) +
+  scale_size_continuous(
+    name = "Count",
+    guide = guide_legend(order = 2)
+  ) +
+  guides(
+      colour = guide_colorbar(order = 1),
+      size   = guide_legend(order = 2)
+    ) +
+  theme(
+    panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+    text             = element_text(size = 13),
+    axis.text        = element_text(size = 13, face = "bold"),
+    axis.text.x      = element_text(color = "black", size = 13, face = "bold"),
+    axis.text.y      = element_text(color = "black", size = 13, face = "bold"), # y轴文字
+    axis.ticks.length= unit(2, "mm"),
+    axis.title       = element_text(size = 14, face = "bold"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position  = "right",
+    legend.title     = element_text(size = 13, face = "bold"),
+    legend.text      = element_text(size = 12),
+    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15), # 标题居中、加粗
+    strip.text       = element_text(size = 13, face = "bold") # facet名称
+  )
+pKNN
+
+pG <- dotplot(gsea_results$Gaussian,
+        showCategory = 20,
+        label_format = 60,
+        split = ".sign") +
+  facet_grid(~.sign) +
+  ggtitle("GSEA - Gaussian") +
+  coord_cartesian(xlim = c(0, 0.55), clip = "off") +
+  scale_color_gradient2(
+    high = "#4575b4", mid = "white", low = "#d73027", midpoint = 0.1,
+    name = "p.adjust",
+    guide = guide_colorbar(order = 1)
+  ) +
+  scale_size_continuous(
+    name = "Count",
+    guide = guide_legend(order = 2)
+  ) +
+  guides(
+      colour = guide_colorbar(order = 1),
+      size   = guide_legend(order = 2)
+    ) +
+  theme(
+    panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+    text             = element_text(size = 13),
+    axis.text        = element_text(size = 13, face = "bold"),
+    axis.text.x      = element_text(color = "black", size = 13, face = "bold"),
+    axis.text.y      = element_text(color = "black", size = 13, face = "bold"), # y轴文字
+    axis.ticks.length= unit(2, "mm"),
+    axis.title       = element_text(size = 14, face = "bold"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position  = "right",
+    legend.title     = element_text(size = 13, face = "bold"),
+    legend.text      = element_text(size = 12),
+    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15), # 标题居中、加粗
+    strip.text       = element_text(size = 13, face = "bold") # facet名称
+  )
+pG
+```
+```{r}
+pDot_Combo <- (pRF|pKNN)/(pMP|pG) +   
+  #plot_layout(guides = "collect") +
+  plot_annotation(tag_levels = 'A') &   
+  theme(
+    plot.tag = element_text(face = "bold", size = 14),
+    plot.tag.position = c(0.02, 0.98)         
+  )
+pDot_Combo
+
+ggsave(
+  filename = "./figure_benchmarking/SCP_Condition_GSEA_DotSupp.tiff",  
+  plot = pDot_Combo,                      
+  device = "tiff",                    
+  dpi = 300,                         
+  width = 15,                         
+  height = 8,                        
+  units = "in"                       
+)
+
+ggsave(
+  filename = "./figure_benchmarking/SCP_Condition_GSEA_DotSH.tiff",  
+  plot = pSH,                      
+  device = "tiff",                    
+  dpi = 300,                          
+  width = 8,                        
+  height = 4,                       
+  units = "in"                       
+)
+```
+
+
+```{r}
+metrics <- c("enrichmentScore", "NES", "pvalue", "p.adjust")
+
+hypoxia_summary <- lapply(names(gsea_results), function(method) {
+  gsea_df <- as.data.frame(gsea_results[[method]])
+  hypoxia_row <- gsea_df[gsea_df$Description == "HALLMARK_HYPOXIA", ]
+  
+  if (nrow(hypoxia_row) == 1) {
+    hypoxia_row <- hypoxia_row[, metrics]
+    hypoxia_row$Method <- method
+    return(hypoxia_row)
+  } else {
+    return(data.frame(matrix(NA, ncol = length(metrics) + 1,
+                             dimnames = list(NULL, c(metrics, "Method")))))
+  }
+})
+
+hypoxia_df <- bind_rows(hypoxia_summary)
+rownames(hypoxia_df) <- c('RF', 'minProb', 'SoftHybrid', 'KNN', 'Gaussian')
+```
+
+```{r}
+hypoxia_df <- hypoxia_df[,-c(1,3)]
+hypoxia_df$GeneRatio <- c(0.43, 0.43, 0.49, 0.37, 0.39)
+```
+
+
+```{r}
+hypoxia_long <- hypoxia_df %>%
+  pivot_longer(cols = -Method, 
+               names_to = "Metric", 
+               values_to = "Value")
+
+method_colors <- c(
+  "RF"         = "#009E73",  
+  "minProb"    = "#D55E00",  
+  "Gaussian"   = "#E69F00",  
+  "KNN"        = "#56B4E9",  
+  "SoftHybrid" = "#9966CC" 
+)
+
+pcombo <- ggplot(hypoxia_long, aes(x = Method, y = Value, fill = Method)) +
+  geom_col(width = 0.7, alpha = 0.9) +
+  scale_fill_manual(values = method_colors) +  
+  facet_wrap(~Metric, scales = "free_y") +
+  theme_bw() +
+  labs(
+    title = "GSEA Results for HALLMARK_HYPOXIA",
+    x = "Imputation Method",
+    y = "Value"
+  ) +
+  theme(
+    text = element_text(size = 12),
+    axis.text = element_text(size = 10),
+    axis.text.x = element_blank(),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14) 
+  )
+
+pcombo
+
+ggsave(
+  filename = "./figure_benchmarking/SCP_Condition_GSEA.tiff",  
+  plot = pcombo,                     
+  device = "tiff",                   
+  dpi = 300,                          
+  width = 8,                         
+  height = 5,                        
+  units = "in"                       
+)
+```
+```{r}
+hypoxia_df$logFDR <- -log10(hypoxia_df$p.adjust)
+
+pHypoxia_data <- 
+ggplot(hypoxia_df, aes(x = logFDR, y = Method)) +
+  geom_point(aes(size = GeneRatio, color = NES), shape = 16) +
+  scale_color_gradient2(low = "#4575b4", mid = "white", high = "#d73027", midpoint = 1.95) +
+  scale_size(range = c(3, 8), trans = "sqrt") +
+  theme_bw() +
+  labs(title = "GSEA Results for HALLMARK_HYPOXIA",
+       x = "-log10(adjusted p-value)", y = "Imputation Method",
+       size = "Gene Ratio", color = "NES") +
+  theme(
+    panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+    text             = element_text(size = 13),
+    axis.text        = element_text(size = 13, face = "bold"),
+    axis.text.x      = element_text(color = "black", size = 13, face = "bold"),
+    axis.text.y      = element_text(color = "black", size = 13, face = "bold"), 
+    axis.ticks.length= unit(2, "mm"),
+    axis.title       = element_text(size = 14, face = "bold"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position  = "right",
+    legend.title     = element_text(size = 13, face = "bold"),
+    legend.text      = element_text(size = 12),
+    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15), 
+    strip.text       = element_text(size = 13, face = "bold") 
+  )
+pHypoxia_data
+ggsave(
+  filename = "./figure_benchmarking/Hypoxia_Results.tiff",  
+  plot = pHypoxia_data,                      
+  device = "tiff",                    
+  dpi = 300,                         
+  width = 7,                         
+  height = 4,                       
+  units = "in"                       
+)
+```
+
+```{r}
+gsea_df <- data.frame(
+  'Hallmark' = c(unlist(strsplit(gsea_results$RF@result$Description, split = '/', fixed = TRUE)),
+  unlist(strsplit(gsea_results$minProb@result$Description, split = '/', fixed = TRUE)),
+  unlist(strsplit(gsea_results$KNN@result$Description, split = '/', fixed = TRUE)),
+  unlist(strsplit(gsea_results$Gaussian@result$Description, split = '/', fixed = TRUE))),
+  'Method' = c(rep('RF', 8), rep('minProb', 6), rep('KNN', 7), rep('Gaussian', 3)),
+  'pvalue' = c(gsea_results$RF@result$p.adjust, gsea_results$minProb@result$p.adjust, gsea_results$KNN@result$p.adjust, gsea_results$Gaussian@result$p.adjust),
+  'GeneRatio' = c(0.431, 0.405, 0.210, 0.292, 0.464, 0.221, 0.450, 0.262, 0.431, 0.428, 0.459, 0.328, 0.221, 0.210, 0.378, 0.333, 0.373, 0.220, 0.321, 0.50, 0.053, 0.392, 0.429, 0.344),
+  'Status' = 'activated'
+)
+```
+
+
+```{r}
+method_lv <- c("RF","minProb","KNN","Gaussian")
+gsea_df$Method <- factor(gsea_df$Method, levels = intersect(method_lv, unique(gsea_df$Method)))
+gsea_df <- gsea_df %>%
+  mutate(logp = -log10(pvalue))
+gsea_df$Status[c(2,5,7,10,11,15,19,20,23)] <- 'suppressed'
+
+pathway_order <- gsea_df %>%
+  group_by(Hallmark) %>%
+  summarize(best_logp = max(logp, na.rm = TRUE), .groups = "drop") %>%
+  arrange(best_logp) %>%
+  pull(Hallmark)
+
+gsea_df$Hallmark <- factor(gsea_df$Hallmark, levels = pathway_order)
+
+gsea_df$Status <- factor(gsea_df$Status, levels = c("activated","suppressed"))
+
+p_gsea_bubble <- ggplot(gsea_df, aes(x = Method, y = Hallmark,
+                                     size = GeneRatio, color = logp)) +
+  geom_point(alpha = 0.9) +
+  scale_size(range = c(0.5, 8), name = "Gene ratio") +
+  scale_color_viridis_c(direction = 1, name = expression(-log[10](pvalue))) +
+  facet_grid(. ~ Status, scales = "free_x", space = "free_x") +  
+  theme_bw() +
+  labs(title = "GSEA bubble plot across imputation methods",
+       x = "Imputation method", y = "Enriched pathways") +
+  theme(
+    panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+    text             = element_text(size = 13),
+    axis.text        = element_text(size = 13, face = "bold"),
+    axis.text.x      = element_text(color = "black", size = 13, face = "bold"),
+    axis.text.y      = element_text(color = "black", size = 13, face = "bold"), 
+    axis.ticks.length= unit(2, "mm"),
+    axis.title       = element_text(size = 14, face = "bold"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position  = "right",
+    legend.title     = element_text(size = 13, face = "bold"),
+    legend.text      = element_text(size = 12),
+    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15),
+    strip.text       = element_text(size = 13, face = "bold") 
+  )
+p_gsea_bubble
+```
+```{r}
+gsea_df2 <- gsea_df %>%
+  mutate(GR_bin = cut(GeneRatio,
+                      breaks = quantile(GeneRatio, probs = seq(0, 1, 0.25), na.rm = TRUE),
+                      include.lowest = TRUE, labels = c("Q1","Q2","Q3","Q4")))
+
+p_gsea_bubble <- ggplot(gsea_df2, aes(x = Method, y = Hallmark,
+                                      size = GR_bin, color = logp)) +
+  geom_point(alpha = 0.95) +
+  facet_grid(. ~ Status, scales = "free_x", space = "free_x") +
+  scale_size_manual(values = c(2, 4, 6, 10), name = "Gene ratio (quantiles)") +
+  scale_color_viridis_c(direction = 1, name = '-log10(pvalue)') +
+  theme_bw() + 
+  labs(title = "GSEA bubble plot across imputation methods",
+                    x = "Imputation method", y = "Enriched pathways") +
+  theme(
+    panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+    text             = element_text(size = 13),
+    axis.text        = element_text(size = 13, face = "bold"),
+    axis.text.x      = element_text(color = "black", size = 13, face = "bold"),
+    axis.text.y      = element_text(color = "black", size = 13, face = "bold"), # y轴文字
+    axis.ticks.length= unit(2, "mm"),
+    axis.title       = element_text(size = 14, face = "bold"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position  = "right",
+    legend.title     = element_text(size = 13, face = "bold"),
+    legend.text      = element_text(size = 12),
+    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15), # 标题居中、加粗
+    strip.text       = element_text(size = 13, face = "bold") # facet名称
+  )
+p_gsea_bubble
+
+ggsave(
+  filename = "./figure_benchmarking/gsea_all_comboinone.tiff",  
+  plot = p_gsea_bubble,                    
+  device = "tiff",                    
+  dpi = 300,                          
+  width = 13,                        
+  height = 5,                     
+  units = "in"                        
+)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -9,6 +9,7 @@ This repository contains the analysis code used in the manuscript:
 - `code/` – R scripts for data preprocessing, imputation, benchmarking, and figure generation.
 - `data/` – Search result data. Raw MS files are **not** stored here.
 - `env/` – Session information and environment files (e.g. `sessionInfo`, `renv.lock`).
+- `docs/` – FASTA files used in raw data searching.
 
 ## Related R package
 

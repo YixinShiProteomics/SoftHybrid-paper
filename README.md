@@ -2,7 +2,7 @@
 
 This repository contains the analysis code used in the manuscript:
 
-> Shi, Y. *et al.*  **SoftHybrid: A Hybrid Imputation Algorithm Optimised for Single-Cell Proteomics Data.**  bioRxiv, 2025. https://www.biorxiv.org/content/10.64898/2026.01.13.699212v1
+> Shi, Y. *et al.*  **SoftHybrid: A Hybrid Imputation Algorithm Optimised for Single-Cell Proteomics Data.**  bioRxiv, 2026. https://www.biorxiv.org/content/10.64898/2026.01.13.699212v1
 
 ## Structure
 

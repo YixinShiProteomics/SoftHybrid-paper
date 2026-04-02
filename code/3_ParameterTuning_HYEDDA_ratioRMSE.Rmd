@@ -1,0 +1,946 @@
+---
+title: "3_ParameterTuning_HYEDIA_ratioRMSE"
+author: "Yixin Shi"
+date: "2026-03-05"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+pacman::p_load(
+  magrittr, ggplot2, ggVennDiagram, pheatmap, ggridges, umap, limma, dplyr, tidyr,
+  viridis, gridExtra, stringr, ggsci, clusterProfiler, org.Mm.eg.db, UpSetR,
+  missForest, ComplexHeatmap, WGCNA, org.Hs.eg.db, GOSemSim, ggrepel,
+  VennDiagram, GSVA, tibble, purrr, scales, imputeLCMD, patchwork, pROC, forcats
+)
+```
+
+# Working Directory
+```{r}
+rm(list = ls())
+getwd()
+```
+
+# Function settings
+```{r}
+load_filtered_protein_matrix <- function(file_path) {
+  df <- read.csv(file_path, sep = "\t", header = TRUE)
+  sample_names <- unlist(lapply(strsplit(colnames(df)[79:94], split = '.', fixed = TRUE), function(x) x[1]))
+  colnames(df)[79:94] <- sample_names
+  df <- df[,c(3:4,79:94)]
+  colnames(df)[1:2] <- c('Protein.Names', 'Genes')
+  
+  filter_protein <- df$Protein.Names[!grepl("contam", df$Protein.Names)]
+  
+  df <- df[df$Protein.Names %in% filter_protein, ]
+  df <- df[, -2]
+  rownames(df) <- df$Protein.Names
+  df <- df[, -1]
+  df <- df[rowSums(df == 0) != ncol(df), ]
+  df[df == 0] <- NA
+  return(df)
+}
+
+extract_metadata_from_colnames <- function(expr_matrix) {
+  metadata <- data.frame(
+    Sample = colnames(expr_matrix),
+    Group  = unlist(lapply(strsplit(colnames(expr_matrix), split = '_', fixed = TRUE), function(x) x[1]))
+  )
+  rownames(metadata) <- metadata$Sample
+  metadata$Group <- factor(metadata$Group)
+  levels(metadata$Group) <- c('SampleA', 'SampleB')
+  return(metadata)
+}
+
+reshape_intensity_long <- function(intensity_matrix, metadata) {
+  long_df <- intensity_matrix %>%
+    mutate(Protein = rownames(.)) %>%
+    pivot_longer(cols = colnames(intensity_matrix),
+                 names_to = "Sample",
+                 values_to = "Intensity")
+  long_df$Group <- plyr::mapvalues(long_df$Sample,
+                                   from = metadata$Sample,
+                                   to = metadata$Group)
+  long_df$Group <- factor(long_df$Group, levels = c(1, 2))
+  levels(long_df$Group) <- c("SampleA", "SampleB")
+  long_df$Sample <- factor(long_df$Sample, levels = metadata$Sample)
+  return(long_df)
+}
+
+filter_log2_matrix_by_missing_rate <- function(intensity_matrix, intensity_long, threshold = 0.9) {
+  tb_cor <- data.frame(
+    row.names = rownames(intensity_matrix),
+    missing_rate = rowSums(is.na(intensity_matrix)) / ncol(intensity_matrix),
+    abundance = rowMeans(log2(intensity_matrix), na.rm = TRUE)
+  )
+  intensity_long_log2 <- intensity_long
+  intensity_long_log2$Intensity <- log2(intensity_long_log2$Intensity)
+
+  valid_proteins <- rownames(tb_cor)[tb_cor$missing_rate < threshold]
+
+  long_filtered <- intensity_long_log2 %>%
+    filter(Protein %in% valid_proteins)
+
+  wide_filtered <- long_filtered %>%
+    dplyr::select(-Group) %>%
+    pivot_wider(names_from = Sample, values_from = Intensity) %>%
+    as.data.frame()
+
+  rownames(wide_filtered) <- wide_filtered$Protein
+  wide_filtered <- wide_filtered[, -1]
+  return(wide_filtered)
+}
+
+median_centering <- function(df) {
+  df_norm <- as.data.frame(apply(df, 2, function(x) {
+    gMedian = median(x, na.rm = TRUE)
+    x - gMedian
+  }))
+  return(df_norm)
+}
+
+run_minprob <- function(data_list,
+                        q = 0.01,
+                        tune.sigma = 0.7,
+                        seed = 25,
+                        save_dir = "./data",
+                        prefix = "minProb") {
+  if (!dir.exists(save_dir)) dir.create(save_dir, recursive = TRUE)
+  results <- list()
+
+  for (name in names(data_list)) {
+    cat("Running minProb imputation for:", name, "\n")
+    set.seed(seed)
+    data <- data_list[[name]]
+
+    time_taken <- system.time({
+      result <- imputeLCMD::impute.MinProb(data, q = q, tune.sigma = tune.sigma)
+    })
+
+    save_path <- file.path(save_dir, paste0(prefix, "_", name, ".Rdata"))
+    save(result, file = save_path)
+
+    results[[name]] <- list(
+      imputed_data = result,
+      time = time_taken,
+      save_path = save_path
+    )
+
+    print(time_taken)
+  }
+  return(results)
+}
+
+run_rf_imputation <- function(df,
+                              seed = 123,
+                              save_path = NULL,
+                              verbose = FALSE) {
+  if (!requireNamespace("missForest", quietly = TRUE)) {
+    stop("Please install the 'missForest' package.")
+  }
+  set.seed(seed)
+
+  time_taken <- system.time({
+    res <- missForest::missForest(as.data.frame(df), verbose = verbose)
+    imputed_df <- res$ximp
+  })
+
+  if (!is.null(save_path)) {
+    save(imputed_df, file = save_path)
+  }
+  print(time_taken)
+
+  return(list(
+    imputed_data = imputed_df,
+    time = time_taken,
+    save_path = save_path
+  ))
+}
+
+run_rf <- function(data_list,
+                   seed = 123,
+                   save_dir = "./data",
+                   prefix = "rf",
+                   verbose = FALSE) {
+  if (!dir.exists(save_dir)) dir.create(save_dir, recursive = TRUE)
+  results <- list()
+
+  for (name in names(data_list)) {
+    cat("Running missForest imputation for:", name, "\n")
+    save_path <- file.path(save_dir, paste0(prefix, "_", name, ".Rdata"))
+
+    result <- run_rf_imputation(
+      df = data_list[[name]],
+      seed = seed,
+      save_path = save_path,
+      verbose = verbose
+    )
+
+    results[[name]] <- result
+  }
+  return(results)
+}
+```
+
+# SoftHybrid Functions
+```{r}
+soft_hybrid_impute <- function(df_rf, df_minProb, df_raw,
+                               r0 = NULL, x0 = NULL, a = 10, b = 5, lambda = 0.4,
+                               visualize = TRUE, group_name = NULL,
+                               save_dir = "./SoftHybrid_DDA_optimisation") {
+  stopifnot(all(dim(df_rf) == dim(df_minProb)))
+  stopifnot(all(rownames(df_rf) == rownames(df_minProb)))
+
+  missing_rate <- rowMeans(is.na(df_raw))
+  mean_intensity <- rowMeans(df_raw, na.rm = TRUE)
+  miss_cor <- data.frame(missing_rate = missing_rate, mean_abundance = mean_intensity)
+
+  q3 <- quantile(miss_cor$missing_rate, 0.75, na.rm = TRUE)
+  skip_loess <- q3 == 0
+
+  if (skip_loess) {
+    elbow_x <- 1 / ncol(df_raw)
+    candidates <- mean_intensity[round(missing_rate, 6) == round(elbow_x, 6)]
+    if (length(candidates) == 0) {
+      elbow_y <- mean(mean_intensity, na.rm = TRUE)
+    } else {
+      elbow_y <- mean(candidates, na.rm = TRUE)
+    }
+  } else {
+    loess_fit <- loess(mean_abundance ~ missing_rate, data = miss_cor, span = 0.75)
+    x_vals <- seq(min(miss_cor$missing_rate), max(miss_cor$missing_rate), length.out = 1000)
+    y_vals <- predict(loess_fit, newdata = data.frame(missing_rate = x_vals))
+    x_start <- x_vals[1]; y_start <- y_vals[1]
+    x_end   <- x_vals[length(x_vals)]; y_end <- y_vals[length(y_vals)]
+    line_vec <- c(x_end - x_start, y_end - y_start)
+    distances <- sapply(1:length(x_vals), function(i) {
+      point_vec <- c(x_vals[i] - x_start, y_vals[i] - y_start)
+      cross_prod <- abs(line_vec[1] * point_vec[2] - line_vec[2] * point_vec[1])
+      norm_line <- sqrt(sum(line_vec^2))
+      return(cross_prod / norm_line)
+    })
+    max_index <- which.max(distances)
+    elbow_x <- x_vals[max_index]
+    elbow_y <- y_vals[max_index]
+  }
+  r0 <- elbow_x
+  x0 <- elbow_y
+  sigmoid <- function(x, k, x0) {
+    1 / (1 + exp(-k * (x - x0)))
+  }
+  sigmoid_r <- sigmoid(missing_rate, k = a, x0 = r0)
+  sigmoid_x <- sigmoid(mean_intensity, k = b, x0 = x0)
+  p_MNAR <- sigmoid_r * (1 - lambda * sigmoid_x)
+  df_imp_soft <- df_rf
+  for (i in seq_len(nrow(df_rf))) {
+    w <- 1 - p_MNAR[i]
+    df_imp_soft[i, ] <- w * df_rf[i, ] + (1 - w) * df_minProb[i, ]
+  }
+  if (visualize) {
+    library(ggplot2)
+    df_plot <- data.frame(
+      Protein = rownames(df_rf),
+      MissingRate = missing_rate,
+      MeanIntensity = mean_intensity,
+      Weight_RF = 1 - p_MNAR
+    )
+    p <- ggplot(df_plot, aes(x = MissingRate, y = MeanIntensity, color = Weight_RF)) +
+      geom_point(size = 1.6, alpha = 0.8) +
+      scale_color_gradient(low = "blue", high = "red", limits = c(0, 1)) +
+      scale_x_continuous(
+        limits = c(0, 1),
+        breaks = seq(0, 1, by = 0.25),
+        labels = percent_format(accuracy = 1)
+      ) +
+      scale_y_continuous(expand = expansion(mult = c(0.02, 0.05))) +
+      labs(
+        title = paste0("Soft Hybrid Weights (", group_name, ")"),
+        x = "Missing Rate",
+        y = "Mean Intensity",
+        color = "RF Weight"
+      ) +
+      theme(
+        panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+        text             = element_text(size = 13),
+        axis.text        = element_text(size = 13, face = "bold"),
+        axis.text.x      = element_text(color = "black", size = 13, face = "bold", angle = 45, hjust = 1),
+        axis.text.y      = element_text(color = "black", size = 13, face = "bold"),
+        axis.ticks.length= unit(2, "mm"),
+        axis.title       = element_text(size = 14, face = "bold"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        legend.position  = "right",
+        legend.title     = element_text(size = 13, face = "bold"),
+        legend.text      = element_text(size = 12),
+        plot.title       = element_text(hjust = 0.5, face = "bold", size = 15),
+        strip.text       = element_text(size = 13, face = "bold")
+      ) +
+      guides(color = guide_colorbar(
+        ticks = TRUE,
+        barheight = unit(48, "pt"),
+        frame.colour = "black"
+      ))
+    print(p)
+    if (!dir.exists(save_dir)) dir.create(save_dir)
+    save(p, file = paste0(save_dir, '/', group_name,"_SoftHybrid_plot.Rdata"))
+    ggsave(
+      filename = file.path(save_dir, paste0(group_name,"_SoftHybrid_plot.tiff")),
+      plot = p,
+      device = "tiff",
+      dpi = 300,
+      width = 6,
+      height = 3.5,
+      units = "in"
+    )
+  }
+  return(df_imp_soft)
+}
+
+run_soft_hybrid_all_groups <- function(raw_list, rf_list, minProb_list,
+                                       lambda = 0.5, a = 10, b = 5, visualize = TRUE) {
+  group_names <- names(raw_list)
+  result_list <- list()
+  for (group in group_names) {
+    cat("Processing group:", group, "\n")
+    df_raw <- raw_list[[group]]
+    df_rf <- rf_list[[group]][['imputed_data']]
+    df_minProb <- minProb_list[[group]][['imputed_data']]
+    result <- soft_hybrid_impute(df_rf, df_minProb, df_raw,
+                                 a = a, b = b, lambda = lambda, visualize = visualize,
+                                 group_name = group)
+    result_list[[group]] <- result
+  }
+  return(result_list)
+}
+```
+
+# Data Preparation
+## Read Data
+```{r}
+intensity_50pg  <- load_filtered_protein_matrix("./data/combined_protein_50pg.tsv")
+intensity_100pg <- load_filtered_protein_matrix("./data/combined_protein_100pg.tsv")
+intensity_1ng   <- load_filtered_protein_matrix("./data/combined_protein_1ng.tsv")
+intensity_10ng  <- load_filtered_protein_matrix("./data/combined_protein_10ng.tsv")
+```
+## Prepare Metadata
+```{r}
+metadata_50pg  <- extract_metadata_from_colnames(intensity_50pg)
+metadata_100pg <- extract_metadata_from_colnames(intensity_100pg)
+metadata_1ng   <- extract_metadata_from_colnames(intensity_1ng)
+metadata_10ng  <- extract_metadata_from_colnames(intensity_10ng)
+```
+## Wide -> Long (for missing filter)
+```{r}
+intensity_50pg_long  <- reshape_intensity_long(intensity_50pg,  metadata_50pg)
+intensity_100pg_long <- reshape_intensity_long(intensity_100pg, metadata_100pg)
+intensity_1ng_long   <- reshape_intensity_long(intensity_1ng,   metadata_1ng)
+intensity_10ng_long  <- reshape_intensity_long(intensity_10ng,  metadata_10ng)
+```
+## Filter by missing rate (<0.9) + log2 transform inside function
+```{r}
+df_50pg_filter  <- filter_log2_matrix_by_missing_rate(intensity_50pg,  intensity_50pg_long)
+df_100pg_filter <- filter_log2_matrix_by_missing_rate(intensity_100pg, intensity_100pg_long)
+df_1ng_filter   <- filter_log2_matrix_by_missing_rate(intensity_1ng,   intensity_1ng_long)
+df_10ng_filter  <- filter_log2_matrix_by_missing_rate(intensity_10ng,  intensity_10ng_long)
+```
+## Normalisation
+```{r}
+df_50pg_norm  <- median_centering(df_50pg_filter)
+df_100pg_norm <- median_centering(df_100pg_filter)
+df_1ng_norm   <- median_centering(df_1ng_filter)
+df_10ng_norm  <- median_centering(df_10ng_filter)
+```
+## Pack lists
+```{r}
+data_list <- list(
+  "50pg"  = df_50pg_norm,
+  "100pg" = df_100pg_norm,
+  "1ng"   = df_1ng_norm,
+  "10ng"  = df_10ng_norm
+)
+
+data_filter_list <- list(
+  "50pg"  = df_50pg_filter,
+  "100pg" = df_100pg_filter,
+  "1ng"   = df_1ng_filter,
+  "10ng"  = df_10ng_filter
+)
+
+if (!dir.exists("./output_DDA_optimise")) dir.create("./output_DDA_optimise", recursive = TRUE)
+save(data_list,        file = "./output_DDA_optimise/data_list.Rdata")
+save(data_filter_list, file = "./output_DDA_optimise/data_filter_list.Rdata")
+```
+
+# Basic imputations needed by SoftHybrid
+```{r}
+## minProb
+if (file.exists("./output_DDA_optimise/minprob_results.Rdata")) {
+  load("./output_DDA_optimise/minprob_results.Rdata")
+} else {
+  minprob_results <- run_minprob(data_list)
+  save(minprob_results, file = "./output_DDA_optimise/minprob_results.Rdata")
+}
+
+## RF
+if (file.exists("./output_DDA_optimise/rf_results.Rdata")) {
+  load("./output_DDA_optimise/rf_results.Rdata")
+} else {
+  rf_results <- run_rf(data_list)
+  save(rf_results, file = "./output_DDA_optimise/rf_results.Rdata")
+}
+```
+ 
+# Hyperparameter Optimisation
+```{r, warning=FALSE}
+## helper: compute log2FC dataframe
+calc_log2_ratio_df <- function(expr_mat, metadata, raw_data) {
+  groupA <- metadata$Sample[metadata$Group == "SampleA"]
+  groupB <- metadata$Sample[metadata$Group == "SampleB"]
+
+  mean_A <- rowMeans(expr_mat[, as.character(groupA), drop = FALSE])
+  mean_B <- rowMeans(expr_mat[, as.character(groupB), drop = FALSE])
+  intensity_B <- rowMeans(raw_data[, as.character(groupB), drop = FALSE])
+
+  log2_ratio <- mean_A - mean_B
+
+  species <- rep(NA, nrow(expr_mat))
+  species[grepl("_HUMAN$", rownames(expr_mat))] <- "Human"
+  species[grepl("_YEAST$", rownames(expr_mat))] <- "Yeast"
+  species[grepl("_ECOLI$|_ECOBD$|_ECOL6$", rownames(expr_mat))] <- "Ecoli"
+  species[is.na(species)] <- "Other"
+
+  data.frame(
+    Protein = rownames(expr_mat),
+    Mean_B = intensity_B,
+    Log2_Ratio = log2_ratio,
+    Species = species,
+    stringsAsFactors = FALSE
+  )
+}
+## Macro RMSE: RMSE(species) then mean across (Ecoli/Human/Yeast)
+score_macro_rmse_ratio <- function(ratio_df,
+                                   ground_truth = c("Ecoli" = -2, "Human" = 0, "Yeast" = 1)) {
+  df <- ratio_df %>% dplyr::filter(Species %in% names(ground_truth))
+  df$Truth <- ground_truth[df$Species]
+  df$Squared_Error <- (df$Log2_Ratio - df$Truth)^2
+
+  sp <- df %>%
+    dplyr::group_by(Species) %>%
+    dplyr::summarise(
+      RMSE = sqrt(mean(Squared_Error, na.rm = TRUE)),
+      .groups = "drop"
+    )
+
+  mean(sp$RMSE, na.rm = TRUE)
+}
+
+## objective: one theta -> mean RMSE across doses
+score_theta_softhybrid <- function(a, b, lambda,
+                                   doses = c("50pg","100pg","1ng","10ng"),
+                                   ground_truth = c("Ecoli"=-2, "Human"=0, "Yeast"=1),
+                                   verbose = FALSE) {
+  ## 1) run SoftHybrid for all groups with given theta
+  ##    IMPORTANT: visualize=FALSE to avoid saving plots during tuning
+  if (verbose) cat("Running SoftHybrid with a=",a," b=",b," lambda=",lambda,"\n")
+
+  imp_soft_list <- run_soft_hybrid_all_groups(
+    raw_list = data_list,
+    rf_list = rf_results,
+    minProb_list = minprob_results,
+    lambda = lambda, a = a, b = b,
+    visualize = FALSE
+  )
+
+  ## 2) score per dose
+  per_dose <- data.frame(Dose = doses, RMSE = NA_real_)
+
+  for (i in seq_along(doses)) {
+    dose <- doses[i]
+    expr_mat <- imp_soft_list[[dose]]
+    raw_data <- get(paste0("df_", dose, "_filter"))
+    metadata <- get(paste0("metadata_", dose))
+
+    ratio_df <- calc_log2_ratio_df(expr_mat, metadata, raw_data)
+    per_dose$RMSE[i] <- score_macro_rmse_ratio(ratio_df, ground_truth = ground_truth)
+  }
+
+  list(
+    a = a, b = b, lambda = lambda,
+    RMSE = mean(per_dose$RMSE, na.rm = TRUE),
+    per_dose = per_dose
+  )
+}
+
+## grid search runner (returns a tidy table sorted by RMSE)
+run_grid_softhybrid <- function(grid_df,
+                                verbose_every = 10,
+                                save_path = "./output_DDA_optimise/softhybrid_tuning_grid_RMSE.rds") {
+
+  res <- vector("list", nrow(grid_df))
+
+  for (i in seq_len(nrow(grid_df))) {
+    a  <- grid_df$a[i]
+    b  <- grid_df$b[i]
+    lam <- grid_df$lambda[i]
+
+    sc <- score_theta_softhybrid(a = a, b = b, lambda = lam)
+
+    rmse_vec <- setNames(sc$per_dose$RMSE, sc$per_dose$Dose)
+
+    res[[i]] <- data.frame(
+      a = a, b = b, lambda = lam,
+      macro_RMSE = sc$RMSE,
+      RMSE_50pg  = rmse_vec["50pg"],
+      RMSE_100pg = rmse_vec["100pg"],
+      RMSE_1ng   = rmse_vec["1ng"],
+      RMSE_10ng  = rmse_vec["10ng"]
+    )
+
+    if (i %% verbose_every == 0 || i == nrow(grid_df)) {
+      message(sprintf(
+        "Done %d/%d | a=%s b=%s lam=%.2f | macroRMSE=%.4f | 50pg=%.4f 100pg=%.4f 1ng=%.4f 10ng=%.4f",
+        i, nrow(grid_df),
+        as.character(a), as.character(b), lam,
+        sc$RMSE,
+        rmse_vec["50pg"], rmse_vec["100pg"], rmse_vec["1ng"], rmse_vec["10ng"]
+      ))
+    }
+  }
+
+  out <- dplyr::bind_rows(res) %>% dplyr::arrange(macro_RMSE)
+  saveRDS(out, save_path)
+  out
+}
+
+## Define grid (coarse -> you can refine later around optimum)
+grid_df <- expand.grid(
+  a = c(2, 5, 10, 20),
+  b = c(1, 2, 5, 10),
+  lambda = seq(0, 1, by = 0.1)
+)
+```
+## Rough Grid Searching
+```{r}
+## Run tuning
+grid_res <- run_grid_softhybrid(grid_df, verbose_every = 5)
+print(head(grid_res, 20))
+
+## Build and save best SoftHybrid results using best theta (for your downstream plotting/limma etc.)
+best <- grid_res[1, ]
+cat("Best theta:\n"); print(best)
+
+imp_soft_best <- run_soft_hybrid_all_groups(
+  raw_list = data_list,
+  rf_list = rf_results,
+  minProb_list = minprob_results,
+  lambda = best$lambda, a = best$a, b = best$b,
+  visualize = FALSE  
+)
+
+softhybrid_results_best <- list()
+softhybrid_results_best[['50pg']]  <- list(imputed_data = imp_soft_best[['50pg']])
+softhybrid_results_best[['100pg']] <- list(imputed_data = imp_soft_best[['100pg']])
+softhybrid_results_best[['1ng']]   <- list(imputed_data = imp_soft_best[['1ng']])
+softhybrid_results_best[['10ng']]  <- list(imputed_data = imp_soft_best[['10ng']])
+
+save(softhybrid_results_best, file = "./output_DDA_optimise/softhybrid_results_best_RMSE.Rdata")
+
+saveRDS(best, file = "./output_DDA_optimise/softhybrid_best_theta_RMSE.rds")
+```
+## Fine tuning
+```{r, warning=FALSE}
+## Define grid (coarse -> you can refine later around optimum)
+grid_df <- expand.grid(
+  a = c(2, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 20),
+  b = c(1, 2, 3, 4, 5, 6, 7, 8, 9, 10),
+  lambda = seq(0, 1, by = 0.1)
+)
+
+## Run tuning
+grid_res <- run_grid_softhybrid(grid_df, verbose_every = 5, save_path = "./output_DDA_optimise/softhybrid_fine_tuning_grid_RMSE_rerun.rds")
+print(head(grid_res, 20))
+
+## Build and save best SoftHybrid results using best theta (for your downstream plotting/limma etc.)
+best <- grid_res[1, ]
+cat("Best theta:\n"); print(best)
+
+imp_soft_best <- run_soft_hybrid_all_groups(
+  raw_list = data_list,
+  rf_list = rf_results,
+  minProb_list = minprob_results,
+  lambda = best$lambda, a = best$a, b = best$b,
+  visualize = FALSE  
+)
+
+softhybrid_results_best <- list()
+softhybrid_results_best[['50pg']]  <- list(imputed_data = imp_soft_best[['50pg']])
+softhybrid_results_best[['100pg']] <- list(imputed_data = imp_soft_best[['100pg']])
+softhybrid_results_best[['1ng']]   <- list(imputed_data = imp_soft_best[['1ng']])
+softhybrid_results_best[['10ng']]  <- list(imputed_data = imp_soft_best[['10ng']])
+
+save(softhybrid_results_best, file = "./output_DDA_optimise/softhybrid_results_best_RMSE_finetuning_rerun.Rdata")
+
+saveRDS(best, file = "./output_DDA_optimise/softhybrid_best_theta_RMSE_finetuning_rerun.rds")
+```
+
+
+# Visualisation
+```{r}
+grid_res <- readRDS(file = "./output_DDA_optimise/softhybrid_fine_tuning_grid_RMSE_rerun.rds")
+# 1) grid_res -> long format (Dose, RMSE)
+df_hm <- grid_res %>%
+  dplyr::select(a, b, lambda, starts_with("RMSE_")) %>%
+  pivot_longer(
+    cols = starts_with("RMSE_"),
+    names_to = "Dose",
+    values_to = "RMSE"
+  ) %>%
+  mutate(
+    Dose = gsub("^RMSE_", "", Dose),
+    Dose = factor(Dose, levels = c("50pg", "100pg", "1ng", "10ng")),
+    a = factor(a, levels = sort(unique(a))),
+    b = factor(b, levels = sort(unique(b))),
+    lambda = factor(sprintf("%.2f", lambda), levels = sprintf("%.2f", sort(unique(lambda))))
+  )
+
+# 2) Heatmap
+p_rmse <- ggplot(df_hm, aes(x = a, y = b, fill = RMSE)) +
+  geom_tile(color = "white", linewidth = 0.25) +
+  facet_grid(
+    rows = vars(Dose),
+    cols = vars(lambda),
+    labeller = labeller(
+      Dose = label_both,
+      lambda = function(x) paste0("Lambda=", x)
+    )
+  ) +
+  scale_fill_viridis_c(name = "RMSE") +
+  labs(
+    title = "SoftHybrid tuning: RMSE heatmap across (a, b) | faceted by Dose (rows) and Lambda (cols)",
+    x = "a",
+    y = "b"
+  ) +
+  theme_bw() +
+  theme(
+    panel.border = element_rect(colour = "black", fill = NA),
+    strip.text = element_text(face = "bold"),
+    axis.text = element_text(color = "black", face = "bold"),
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+
+p_rmse
+```
+```{r}
+dose_pick <- "1ng"
+
+p_one <- df_hm %>%
+  filter(Dose == dose_pick) %>%
+  ggplot(aes(x = a, y = b, fill = RMSE)) +
+  geom_tile(color = "white", linewidth = 0.25) +
+  facet_wrap(~ lambda, ncol = 6) +
+  scale_fill_viridis_c(name = "RMSE") +
+  labs(
+    title = paste0("RMSE heatmap at dose = ", dose_pick, " | facets are Lambda"),
+    x = "a", y = "b"
+  ) +
+  theme_bw() +
+  theme(strip.text = element_text(face = "bold"))
+
+p_one
+```
+```{r}
+df_curve <- df_hm %>%
+  group_by(Dose, lambda) %>%
+  summarise(best_RMSE = min(RMSE, na.rm = TRUE), .groups = "drop") %>%
+  mutate(
+    Dose = factor(Dose, levels = c("50pg","100pg","1ng","10ng"))
+  )
+
+p_curve <- ggplot(df_curve, aes(x = as.numeric(as.character(lambda)),
+                               y = best_RMSE, group = Dose)) +
+  geom_line(linewidth = 1.0) +
+  geom_point(size = 2.0) +
+  facet_wrap(~ Dose, ncol = 2, scales = "free_y") +
+  labs(
+    title = "Tuning curve: best RMSE (min over a,b) vs Lambda",
+    x = "Lambda",
+    y = "Best RMSE"
+  ) +
+  theme_bw() +
+  theme(plot.title = element_text(face = "bold", hjust = 0.5))
+
+p_curve
+```
+
+```{r}
+df_avg <- df_hm %>%
+  group_by(a, b, lambda) %>%
+  summarise(
+    RMSE_mean = mean(RMSE, na.rm = TRUE),
+    RMSE_sd   = sd(RMSE, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+best_param <- df_avg %>%
+  slice_min(RMSE_mean, n = 1)
+
+best_param
+```
+```{r}
+p_heat <- ggplot(df_avg, aes(x = a, y = b, fill = RMSE_mean)) +
+  geom_tile(color = "white") +
+  facet_wrap(~ lambda) +
+  scale_fill_viridis_c(name = "Mean RMSE") +
+  labs(
+    title = "Global SoftHybrid parameter surface",
+    subtitle = "Mean RMSE across four doses",
+    x = "Parameter a",
+    y = "Parameter b"
+  ) +
+  theme_bw() +
+  theme(
+    strip.text = element_text(face = "bold"),
+    plot.title = element_text(face = "bold", hjust = 0.5)
+  )
+
+p_heat
+
+p_heat +
+  geom_point(
+    data = best_param,
+    aes(x = a, y = b),
+    inherit.aes = FALSE,
+    shape = 21,
+    size = 4,
+    stroke = 1.2
+  )
+```
+```{r}
+df_avg2 <- df_avg %>%
+  dplyr::filter(!(as.numeric(as.character(lambda)) %in% c(0, 1)))
+
+p_heat <- ggplot(df_avg2, aes(x = a, y = b, fill = RMSE_mean)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  facet_wrap(~ lambda) +
+  scale_fill_viridis_c(name = "Mean RMSE") +
+  labs(
+    title = "SoftHybrid parameter surface",
+    subtitle = "Mean RMSE across four doses",
+    x = "Parameter a",
+    y = "Parameter b"
+  ) +
+  theme_bw() +
+  theme(
+    strip.text = element_text(face = "bold"),
+    plot.title = element_text(face = "bold", hjust = 0.5)
+  )
+
+p_heat
+```
+```{r}
+df_lambda <- grid_res %>%
+  group_by(lambda) %>%
+  summarise(
+    RMSE_mean = mean(macro_RMSE, na.rm = TRUE),
+    RMSE_sd   = sd(macro_RMSE, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(lambda)
+
+p_lambda_curve_g <- 
+ggplot(df_lambda, aes(x = lambda, y = RMSE_mean)) +
+
+  geom_line(linewidth = 1) +
+
+  geom_point(size = 2) +
+
+  geom_errorbar(
+    aes(
+      ymin = RMSE_mean - RMSE_sd,
+      ymax = RMSE_mean + RMSE_sd
+    ),
+    width = 0.02,
+    linewidth = 0.6
+  ) +
+
+  labs(
+    title = "Global lambda tuning: DIA-HYE",
+    x = "lambda",
+    y = "Mean RMSE"
+  ) +
+
+  theme_bw() +
+
+  theme(
+    panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+    text             = element_text(size = 13),
+    axis.text        = element_text(size = 13, face = "bold"),
+    axis.text.x      = element_text(color = "black", size = 13, face = "bold"), 
+    axis.text.y      = element_text(color = "black", size = 13, face = "bold"), 
+    axis.ticks.length= unit(2, "mm"),
+    axis.title       = element_text(size = 14, face = "bold"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position  = "right",
+    legend.title     = element_text(size = 14, face = "bold"),
+    legend.text      = element_text(size = 13),
+    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15), 
+    strip.text       = element_text(size = 13, face = "bold") 
+  )
+
+p_lambda_curve_g
+```
+```{r}
+df_ab_lambda05 <- df_hm %>%
+  mutate(lambda = as.numeric(as.character(lambda))) %>%
+  filter(lambda == 0.5) %>%
+  group_by(a, b) %>%
+  summarise(
+    RMSE_mean = mean(RMSE, na.rm = TRUE),
+    RMSE_sd   = sd(RMSE, na.rm = TRUE),
+    .groups = "drop"
+  )
+best_ab <- df_ab_lambda05 %>%
+  slice_min(RMSE_mean, n = 1)
+p_ab <- ggplot(df_ab_lambda05, aes(x = a, y = b, fill = RMSE_mean)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  #scale_fill_viridis_c(name = "Mean RMSE") +
+  scale_fill_gradient2(
+    name = "Mean RMSE",
+    high = "#2166AC",     
+    mid = "white",
+    low = "#B2182B",    
+    midpoint = 0.571
+  ) +
+  labs(
+    title = "Global a/b tuning: DDA-HYE",
+    subtitle = "λ = 0.5 | RMSE averaged across four doses",
+    x = "Parameter a",
+    y = "Parameter b"
+  ) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.text = element_text(face = "bold")
+  )
+
+p_ab
+p_final_0.5 <- 
+p_ab +
+  geom_point(
+    data = best_ab,
+    aes(x = a, y = b),
+    color = "black",
+    inherit.aes = FALSE,
+    shape = 21,
+    size = 4,
+    stroke = 1.2
+  ) +
+  theme(
+    panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+    text             = element_text(size = 13),
+    axis.text        = element_text(size = 13, face = "bold"),
+    axis.text.x      = element_text(color = "black", size = 13, face = "bold",
+                                    angle = 90, vjust = 0.5, hjust = 1), 
+    axis.text.y      = element_text(color = "black", size = 13, face = "bold"), 
+    axis.ticks.length= unit(2, "mm"),
+    axis.title       = element_text(size = 14, face = "bold"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position  = "right",
+    legend.title     = element_text(size = 14, face = "bold"),
+    legend.text      = element_text(size = 13),
+    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15), 
+    strip.text       = element_text(size = 13, face = "bold") 
+  )
+p_final_0.5
+```
+
+```{r}
+df_ab_lambda04 <- df_hm %>%
+  mutate(lambda = as.numeric(as.character(lambda))) %>%
+  filter(lambda == 0.4) %>%
+  group_by(a, b) %>%
+  summarise(
+    RMSE_mean = mean(RMSE, na.rm = TRUE),
+    RMSE_sd   = sd(RMSE, na.rm = TRUE),
+    .groups = "drop"
+  )
+best_ab <- df_ab_lambda04 %>%
+  slice_min(RMSE_mean, n = 1)
+p_ab <- ggplot(df_ab_lambda04, aes(x = a, y = b, fill = RMSE_mean)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  #scale_fill_viridis_c(name = "Mean RMSE") +
+  scale_fill_gradient2(
+    name = "Mean RMSE",
+    high = "#2166AC",     
+    mid = "white",
+    low = "#B2182B",    
+    midpoint = 0.571
+  ) +
+  labs(
+    title = "Global a/b tuning: DDA-HYE",
+    subtitle = "λ = 0.4 | RMSE averaged across four doses",
+    x = "Parameter a",
+    y = "Parameter b"
+  ) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.text = element_text(face = "bold")
+  )
+
+p_ab
+p_final_0.4 <- 
+p_ab +
+  geom_point(
+    data = best_ab,
+    aes(x = a, y = b),
+    color = "black",
+    inherit.aes = FALSE,
+    shape = 21,
+    size = 4,
+    stroke = 1.2
+  ) +
+  theme(
+    panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+    text             = element_text(size = 13),
+    axis.text        = element_text(size = 13, face = "bold"),
+    axis.text.x      = element_text(color = "black", size = 13, face = "bold",
+                                    angle = 90, vjust = 0.5, hjust = 1), 
+    axis.text.y      = element_text(color = "black", size = 13, face = "bold"), 
+    axis.ticks.length= unit(2, "mm"),
+    axis.title       = element_text(size = 14, face = "bold"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position  = "right",
+    legend.title     = element_text(size = 14, face = "bold"),
+    legend.text      = element_text(size = 13),
+    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15), 
+    strip.text       = element_text(size = 13, face = "bold") 
+  )
+p_final_0.4
+```
+## Export
+```{r}
+p_combo <- p_lambda_curve_g | p_final_0.5 | p_final_0.4
+p_combo
+
+ggsave(
+  filename = "./figure/DDA_HYE_tuning.tiff",  
+  plot = p_combo,                      
+  device = "tiff",                    
+  dpi = 300,                         
+  width = 13,                         
+  height = 3.8,                       
+  units = "in"                        
+)
+```
+
+
+
+
+
+
+
+

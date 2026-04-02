@@ -1,0 +1,573 @@
+---
+title: "7_ImputationBenchmarking_SCP_MSImpute"
+author: "Yixin Shi"
+date: "2026-03-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+pacman::p_load(magrittr, ggplot2, ggVennDiagram, pheatmap, ggridges, umap, limma, dplyr, tidyr, viridis, gridExtra, stringr, ggsci, clusterProfiler, org.Mm.eg.db, UpSetR, missForest, ComplexHeatmap, WGCNA, org.Hs.eg.db, GOSemSim, ggrepel, VennDiagram, GSVA, tibble, purrr, scales, imputeLCMD, patchwork, mclust, cluster, preprocessCore, aricode, ggpubr)
+```
+
+# Install MSImpute
+```{r}
+#install.packages("devtools") # devtools is required to download and install the package
+#devtools::install_github("DavisLaboratory/msImpute")
+```
+
+# Load data
+```{r}
+rm(list = ls())
+getwd()
+
+xna <- readRDS(file = './data/intensity_scp.rds')
+xna <- log2(xna)
+
+metadata_scp <- data.frame("sample" = colnames(xna),
+                           "group" = rep(c("GSC", 'AST', "MAC", "MIC"), each = 20))
+metadata_scp$group <- metadata_scp$group %>%
+                                factor(levels = c("GSC", 'AST', "MAC", "MIC"))
+### mark the number of protein types detected
+metadata_scp$ID <- apply(xna, 2, function(x) sum(!is.na(x)))
+rownames(metadata_scp) <- metadata_scp$sample
+filter_sample <- metadata_scp[metadata_scp$ID >= 1000, "sample"]
+metadata_scp <- metadata_scp[filter_sample,]
+
+tb_cor = data.frame(row.names = row.names(xna), 
+                    missing_rate = rowSums(is.na(xna)) / ncol(xna),
+                    abundance = rowMeans(log2(xna), na.rm = T))
+
+geneName <- tb_cor %>%
+  filter(missing_rate < 0.9) %>%
+  rownames(.)
+
+xna <- xna[geneName,filter_sample]
+
+xna_qn <- normalize.quantiles(as.matrix(xna))
+rownames(xna_qn) <- rownames(xna)
+colnames(xna_qn) <- colnames(xna)
+
+load(file = './data/SoftHybridImputation_benchmarking.Rdata')
+load(file = './data/bulk_benchmarking.Rdata')
+load(file = './data/metadata_bulk_benchmarking.Rdata')
+xna_qn <- xna_qn[rownames(df_imp_soft),]
+```
+
+```{r}
+library(msImpute)
+# Let xna be a numeric matrix of (unormalised) log-intensity with NAs 
+# Let "group" define a single experimental condition (e.g. control, treatment etc).
+# Let "design" define the experimental design (e.g. model.matrix(~0+group+batch)).
+
+# select peptides missing in at least one experimental group
+group <- metadata_scp$group
+test <- selectFeatures(xna_qn, method="ebm", group=group) 
+
+# Impute complex MV mechanims (MNAR and MAR) as mixture of two normal distributions (known as the Barycenter approach) 
+design <- model.matrix(~0+group)
+xcomplete <- msImpute(xna_qn, method="v2-mnar", design=design)  
+```
+```{r}
+calc_ari <- function(expr_mat, metadata, k = 4) {
+  pca <- prcomp(t(expr_mat), scale. = TRUE)
+  pca_coord <- pca$x  
+  
+  set.seed(123)
+  km <- kmeans(pca_coord, centers = k, nstart = 50)
+  
+  true_label <- metadata$group
+  pred_label <- km$cluster
+  ari <- adjustedRandIndex(true_label, pred_label)
+  
+  return(ari)
+}
+
+imp_list <- list(
+  MSImpute = xcomplete,
+  SoftHybrid = df_imp_soft
+)
+
+colnames(imp_list$MSImpute) <- paste0(colnames(xcomplete), '_MSImpute')
+colnames(imp_list$SoftHybrid) <- paste0(colnames(df_imp_soft), '_SoftHybrid')
+
+imp_list_combined <- cbind(imp_list$MSImpute,imp_list$SoftHybrid)
+
+metadata_combined <- data.frame(
+  'Sample' = colnames(imp_list_combined),
+  'Method' = c(rep(c('MSImpute', 'SoftHybrid'), each = 74)),
+  'Group' = c(rep(metadata_scp$group, 2))
+)
+
+metadata_combined$Method <- factor(metadata_combined$Method, levels = c('MSImpute', 'SoftHybrid'))
+metadata_combined$Group <- factor(metadata_combined$Group, levels = c('GSC', 'AST', 'MAC', 'MIC'))
+rownames(metadata_combined) <- metadata_combined$Sample
+```
+
+# Iteration of ARI 
+```{r}
+calc_metrics_subsample <- function(expr_mat, metadata, k = 4, n_iter = 20, prop = 0.8, seed = 123) {
+  
+  metadata_use <- metadata[colnames(expr_mat), , drop = FALSE]
+  
+  if (!all(colnames(expr_mat) == rownames(metadata_use))) {
+    stop("metadata rownames do not match expr_mat colnames.")
+  }
+  
+  res_list <- vector("list", length = n_iter)
+  
+  for (i in seq_len(n_iter)) {
+    set.seed(seed + i)
+    
+    idx <- sample(seq_len(ncol(expr_mat)),
+                  size = floor(prop * ncol(expr_mat)),
+                  replace = FALSE)
+    
+    expr_sub <- expr_mat[, idx, drop = FALSE]
+    meta_sub <- metadata_use[idx, , drop = FALSE]
+    
+    # PCA
+    pca <- prcomp(t(expr_sub), scale. = TRUE)
+    pca_coord <- pca$x
+    
+    # kmeans
+    km <- kmeans(pca_coord, centers = k, nstart = 50)
+    pred_cluster <- km$cluster
+    true_label <- meta_sub$group
+    
+    # ARI
+    ari_val <- adjustedRandIndex(true_label, pred_cluster)
+    
+    # NMI
+    nmi_val <- NMI(as.character(true_label), as.character(pred_cluster))
+    
+    # Silhouette score
+    dist_mat <- dist(pca_coord)
+    sil <- silhouette(pred_cluster, dist_mat)
+    sil_mean <- mean(sil[, "sil_width"])
+    
+    res_list[[i]] <- data.frame(
+      Iteration = i,
+      ARI = ari_val,
+      NMI = nmi_val,
+      Silhouette = sil_mean
+    )
+  }
+  
+  bind_rows(res_list)
+}
+```
+
+```{r}
+colnames(imp_list$MSImpute) <- paste0(colnames(xcomplete))
+colnames(imp_list$SoftHybrid) <- paste0(colnames(df_imp_soft))
+
+metric_results <- lapply(names(imp_list), function(m) {
+  
+  mat <- imp_list[[m]]
+  
+  res <- calc_metrics_subsample(
+    expr_mat = mat,
+    metadata = metadata_scp,
+    k = 4,
+    n_iter = 20,
+    prop = 0.8,
+    seed = 123
+  )
+  
+  res$Method <- m
+  res
+  
+}) %>% bind_rows()
+
+metric_results$Method <- factor(metric_results$Method, levels = c("MSImpute", "SoftHybrid"))
+
+head(metric_results)
+```
+```{r}
+metric_results$Method <- factor(metric_results$Method, levels = c("MSImpute", "SoftHybrid"))
+
+metric_results <- metric_results[,-4]
+
+metric_long <- metric_results %>%
+  pivot_longer(
+    cols = c(ARI, NMI),
+    names_to = "Metric",
+    values_to = "Value"
+  )
+
+metric_long$Metric <- factor(metric_long$Metric, levels = c("ARI", "NMI"))
+
+metric_summary <- metric_long %>%
+  group_by(Metric, Method) %>%
+  summarise(
+    mean_value = mean(Value, na.rm = TRUE),
+    sd_value = sd(Value, na.rm = TRUE),
+    median_value = median(Value, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+metric_pvals <- metric_long %>%
+  group_by(Metric) %>%
+  summarise(
+    p_value = wilcox.test(Value ~ Method, data = cur_data(), exact = FALSE)$p.value,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    significance = case_when(
+      p_value < 0.001 ~ "***",
+      p_value < 0.01  ~ "**",
+      p_value < 0.05  ~ "*",
+      TRUE            ~ "ns"
+    )
+  )
+
+metric_ypos <- metric_long %>%
+  group_by(Metric) %>%
+  summarise(
+    y_max = max(Value, na.rm = TRUE),
+    y_min = min(Value, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(metric_pvals, by = "Metric") %>%
+  mutate(
+    y_line = y_max + 0.08 * (y_max - y_min + 1e-6),
+    y_text = y_max + 0.15 * (y_max - y_min + 1e-6)
+  )
+
+my_colors <- c(
+  "MSImpute"   = "#E69F00",
+  "SoftHybrid" = "#9966CC"
+)
+
+p_metrics <- ggplot(metric_long, aes(x = Method, y = Value, fill = Method)) +
+  geom_boxplot(width = 0.6, 
+               outlier.shape = NA, 
+               color = "black", 
+               linewidth = 0.5) +
+  stat_summary(
+    fun = mean,
+    geom = "point",
+    shape = 21,
+    size = 2.8,
+    fill = "white",
+    color = "black",
+    stroke = 0.9
+  ) +
+
+  geom_segment(
+    data = metric_ypos,
+    aes(x = 1, xend = 2, y = y_line, yend = y_line),
+    inherit.aes = FALSE,
+    linewidth = 0.8
+  ) +
+  geom_segment(
+    data = metric_ypos,
+    aes(x = 1, xend = 1, y = y_line - 0.01, yend = y_line),
+    inherit.aes = FALSE,
+    linewidth = 0.8
+  ) +
+  geom_segment(
+    data = metric_ypos,
+    aes(x = 2, xend = 2, y = y_line - 0.01, yend = y_line),
+    inherit.aes = FALSE,
+    linewidth = 0.8
+  ) +
+  geom_text(
+    data = metric_ypos,
+    aes(x = 1.5, y = y_text, label = significance),
+    inherit.aes = FALSE,
+    size = 4.8,
+    fontface = "bold"
+  ) +
+  scale_fill_manual(values = my_colors) +
+  facet_wrap(~ Metric, scales = "free_y", nrow = 1) +
+  theme_bw() +
+  labs(
+    x = "Method"
+  ) +
+  theme(
+    panel.border      = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+    text              = element_text(size = 13),
+    axis.text         = element_text(size = 12.5, face = "bold", color = "black"),
+    axis.text.x       = element_blank(),
+    axis.title        = element_blank(),
+    axis.ticks.length.y = unit(2, "mm"),
+    panel.grid.major  = element_blank(),
+    panel.grid.minor  = element_blank(),
+    legend.position   = "right",
+    legend.title      = element_text(size = 13, face = "bold"),
+    legend.text       = element_text(size = 12),
+    plot.title        = element_text(hjust = 0.5, face = "bold", size = 15),
+    strip.background  = element_rect(fill = "white", color = "black", linewidth = 0.6),
+    strip.text        = element_text(size = 13, face = "bold")
+  )
+
+p_metrics
+```
+
+# Pearson Correlation with Ground Truth
+## Function Settings
+```{r}
+evaluate_function <- function(imputed_mat, truth_mat, metadata) {
+  result_list <- list()
+  for (grp in unique(metadata$group)) {
+    samples <- metadata %>% filter(group == grp) %>% pull(sample)
+    common_genes <- intersect(rownames(imputed_mat), rownames(truth_mat))
+    truth_vec <- truth_mat[common_genes, grp]
+    expr_mat  <- imputed_mat[common_genes, samples]
+    stats <- apply(expr_mat, 2, function(x) {
+      list(
+        RMSE     = sqrt(mean((x - truth_vec)^2, na.rm = TRUE)),
+        MAE      = mean(abs(x - truth_vec), na.rm = TRUE),
+        Pearson  = cor(x, truth_vec, method = "pearson", use = "complete.obs"),
+        Spearman = cor(x, truth_vec, method = "spearman", use = "complete.obs")
+      )
+    })
+    df_stat <- bind_rows(stats, .id = "Sample") %>%
+      mutate(group = grp)
+    result_list[[grp]] <- df_stat
+  }
+  bind_rows(result_list)
+}
+```
+## Evaluation
+```{r}
+df_truth <- df_bulk %>%
+  mutate(gene = rownames(.)) %>%
+  pivot_longer(cols = colnames(df_bulk), 
+               names_to = "sample", 
+               values_to = "intensity")
+df_truth$group <- plyr::mapvalues(df_truth$sample,
+                                  from = metadata_bulk$sample,
+                                  to = metadata_bulk$group)
+df_truth$group <- factor(df_truth$group, levels = c(1,2,3,4))
+levels(df_truth$group) <- c("GSC", 'AST', "MAC", "MIC")
+df_truth <- df_truth %>%
+  group_by(gene, group) %>%
+  summarise(
+    MeanExpr   = mean(intensity, na.rm = TRUE),
+    .groups = "drop"
+  )
+NA_rm <- df_truth %>%
+  filter(is.na(MeanExpr)) %>%
+  .$gene
+NA_rm <- unique(NA_rm)
+df_truth <- df_truth %>%
+  filter(!gene %in% NA_rm)
+test <- unique(df_truth$gene)
+
+xcomplete_bm <- xcomplete %>%
+  as.data.frame() %>%
+  filter(rownames(.) %in% test)
+df_imp_soft_bm <- df_imp_soft %>%
+  filter(rownames(.) %in% test)
+
+imp_list_bm <- list(
+  MSImpute = xcomplete_bm,
+  SoftHybrid = df_imp_soft_bm
+)
+truth_mat <- df_truth %>%
+  pivot_wider(names_from = group, values_from = MeanExpr) %>%
+  column_to_rownames("gene")
+
+
+result_combined <- map2_dfr(imp_list_bm, names(imp_list_bm), ~{
+  df <- evaluate_function(.x, truth_mat, metadata_scp)
+  df$Method <- .y
+  df
+})
+```
+## Visulisation
+```{r}
+method_colors <- c(
+  "MSImpute"   = "#E69F00",
+  "SoftHybrid" = "#9966CC"
+)
+
+plot_df <- result_combined %>%
+  dplyr::select(Sample, Method, MAE, Spearman) %>%
+  pivot_longer(
+    cols = c(MAE, Spearman),
+    names_to = "Metric",
+    values_to = "Value"
+  ) %>%
+  dplyr::mutate(
+    Metric = factor(Metric, levels = c("MAE", "Spearman"))
+  )
+
+mean_df <- plot_df %>%
+  dplyr::group_by(Metric, Method) %>%
+  dplyr::summarise(
+    mean_value = mean(Value, na.rm = TRUE),
+    max_value  = max(Value, na.rm = TRUE),
+    min_value  = min(Value, na.rm = TRUE),
+    range_value = max_value - min_value,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    y_text = max_value + ifelse(range_value == 0, 0.05, 0.08 * range_value)
+  )
+
+sig_df <- plot_df %>%
+  group_by(Metric) %>%
+  group_modify(~{
+    tmp_wide <- .x %>%
+      dplyr::select(Sample, Method, Value) %>%
+      group_by(Sample, Method) %>%
+      summarise(Value = mean(Value, na.rm = TRUE), .groups = "drop") %>%
+      pivot_wider(names_from = Method, values_from = Value) %>%
+      drop_na()
+
+    wt <- wilcox.test(
+      tmp_wide$SoftHybrid,
+      tmp_wide$MSImpute,
+      paired = TRUE,
+      alternative = "two.sided"
+    )
+
+    y_max <- max(.x$Value, na.rm = TRUE)
+    y_min <- min(.x$Value, na.rm = TRUE)
+    y_rng <- y_max - y_min
+    y_pos <- y_max + ifelse(y_rng == 0, 0.08, 0.12 * y_rng)
+
+    tibble(
+      group1 = "MSImpute",
+      group2 = "SoftHybrid",
+      p = wt$p.value,
+      p.signif = case_when(
+        wt$p.value < 0.001 ~ "***",
+        wt$p.value < 0.01  ~ "**",
+        wt$p.value < 0.05  ~ "*",
+        TRUE ~ "ns"
+      ),
+      p.label = paste0("p = ", signif(wt$p.value, 3)),
+      y.position = y_pos
+    )
+  }) %>%
+  dplyr::ungroup()
+
+plot_df$Metric <- factor(plot_df$Metric, levels = c('Spearman', 'MAE'))
+
+p_metrics_2 <- ggplot(
+  plot_df,
+  aes(x = Method, y = Value, fill = Method)
+) +
+  geom_boxplot(
+    width = 0.6,
+    outlier.shape = NA,
+    color = "black",
+    linewidth = 0.5
+  ) +
+  stat_summary(
+    fun = mean,
+    geom = "point",
+    shape = 21,
+    size = 3,
+    fill = "white",
+    color = "black",
+    stroke = 0.8
+  ) +
+  stat_pvalue_manual(
+    sig_df,
+    label = "p.signif",   
+    xmin = "group1",
+    xmax = "group2",
+    y.position = "y.position",
+    tip.length = 0.01,
+    bracket.size = 0.5,
+    size = 5,
+    inherit.aes = FALSE
+  ) +
+  scale_fill_manual(values = method_colors) +
+  facet_wrap(~Metric, scales = "free_y", nrow = 1,
+             labeller = as_labeller(c(
+               MAE = "AE",
+               Spearman = "Spearman"
+             ))) +
+  theme_bw() +
+  labs(
+    x = "Imputation Method",
+    y = NULL
+  ) +
+  theme(
+    panel.border      = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+    text              = element_text(size = 13),
+    axis.text         = element_text(size = 12.5, face = "bold", color = "black"),
+    axis.text.x       = element_blank(),
+    axis.title        = element_text(size = 14, face = "bold"),
+    axis.title.x      = element_blank(),
+    axis.ticks.length.y = unit(2, "mm"),
+    panel.grid.major  = element_blank(),
+    panel.grid.minor  = element_blank(),
+    legend.position   = "right",
+    legend.title      = element_text(size = 13, face = "bold"),
+    legend.text       = element_text(size = 12),
+    plot.title        = element_text(hjust = 0.5, face = "bold", size = 15),
+    strip.background  = element_rect(fill = "white", color = "black", linewidth = 0.6),
+    strip.text        = element_text(size = 13, face = "bold")
+  )
+
+p_metrics_2
+```
+
+```{r}
+p_combo <- (p_metrics | p_metrics_2) +
+  plot_layout(guides = "collect") +
+  plot_annotation(
+    title = "Benchmarking of SoftHybrid and MSImpute"
+  ) &
+  theme(legend.position = "bottom") +
+  theme(
+    panel.border      = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+    text              = element_text(size = 13),
+    axis.text         = element_text(size = 12.5, face = "bold", color = "black"),
+    axis.text.x       = element_blank(),
+    axis.title        = element_text(size = 14, face = "bold"),
+    axis.title.x      = element_blank(),
+    axis.ticks.length.y = unit(2, "mm"),
+    panel.grid.major  = element_blank(),
+    panel.grid.minor  = element_blank(),
+    legend.position   = "right",
+    legend.title      = element_text(size = 13, face = "bold"),
+    legend.text       = element_text(size = 12),
+    plot.title        = element_text(hjust = 0.5, face = "bold", size = 15),
+    strip.background  = element_rect(fill = "white", color = "black", linewidth = 0.6),
+    strip.text        = element_text(size = 13, face = "bold")
+  )
+p_combo
+```
+
+# Export Image
+```{r}
+ggsave(
+  filename = "./figure_benchmarking/SHI_MSImpute.tiff",  
+  plot = p_combo,                      
+  device = "tiff",                    
+  dpi = 300,                         
+  width = 7,                         
+  height = 4.8,                        
+  units = "in"                        
+)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

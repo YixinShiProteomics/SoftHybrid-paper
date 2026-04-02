@@ -1,0 +1,314 @@
+---
+title: "0_BIND Classifier"
+author: "Yixin Shi"
+date: "2025-07-10"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+pacman::p_load(magrittr, ggplot2, ggVennDiagram, pheatmap, ggridges, umap, limma, dplyr, tidyr, viridis, gridExtra, stringr, ggsci, clusterProfiler, org.Mm.eg.db, UpSetR, missForest,ComplexHeatmap, WGCNA, org.Hs.eg.db, GOSemSim, ggrepel, VennDiagram, GSVA, argparse)
+```
+
+
+```{r cars}
+rm(list = ls())
+getwd()
+
+data_mtx <- read.csv("./data/report.unique_genes_matrix_1cell_n.tsv", sep = "\t", header = T)
+rownames(data_mtx) <- data_mtx$Genes
+data_mtx <- data_mtx[,-1]
+sample <- unlist(lapply(strsplit(colnames(data_mtx), split = '_', fixed = TRUE), function(x) x[9]))
+group <- unlist(lapply(strsplit(colnames(data_mtx), split = '_', fixed = TRUE), function(x) x[5]))
+colnames(data_mtx) <- unlist(lapply(strsplit(sample, split = '.', fixed = TRUE), function(x) x[1]))
+demoGSC <- data_mtx[,21:40]
+demoAST <- data_mtx[,1:20]
+data_mtx <- cbind(demoGSC,demoAST,data_mtx[,-(1:40)])
+data_mtx <- log2(data_mtx)
+
+info_mtx <- data.frame("sample" = colnames(data_mtx) %>%
+                        as.factor(),"group" = rep(c("GSC", 'AST', "MAC", "MIC"), each = 20))
+info_mtx$group <- info_mtx$group %>%
+                                factor(levels = c("GSC", 'AST', "MAC", "MIC"))
+### mark the number of protein types detected
+info_mtx$ID <- apply(data_mtx, 2, function(x) sum(!is.na(x)))
+rownames(info_mtx) <- info_mtx$sample
+group_name <- "Cell_type"
+info_mtx <- info_mtx[info_mtx$ID > 1000,] 
+data_mtx <- data_mtx[,rownames(info_mtx)]
+k <- 5;th <- 3
+```
+
+```{r}
+bind_stat_sub <- function(df){
+  exp_df <- df
+  res <- list()
+  df[!is.na(df)] <- 1
+  df[is.na(df)] <- 0
+  row_NA_count <- rowSums(df == 0)
+  res[['binary_df']] <- df #df[order(row_NA_count, decreasing = TRUE), ]
+  res[['row_na_stat']] <- as.data.frame(row_NA_count)
+  res[['row_na_stat']]$row_NA_ratio <- res[['row_na_stat']]$row_NA_count / ncol(df)
+  res[['row_na_stat']]$means_without_na <- rowMeans(exp_df, na.rm = T)
+  res[['row_na_stat']]$na_ratio_cat <- ifelse(res[['row_na_stat']]$row_NA_ratio > 0.8, 1, ifelse(res[['row_na_stat']]$row_NA_ratio < 0.2, -1, 0))
+  return(res)
+}
+
+proc_res <- bind_stat_sub(data_mtx)
+proc_df <- proc_res[['binary_df']]
+
+
+ft_binarydf <- proc_df[rowSums(proc_df == 0) / ncol(proc_df) < 1,]
+ft_expdf <- data_mtx[rowSums(is.na(data_mtx)) / ncol(data_mtx) < 1,]
+ft_expdf[is.na(ft_expdf)] <- 0
+
+### distance calculation
+dist_matrix <- dist(t(ft_expdf), method = 'euclidean') %>% as.matrix()
+
+gaussian_kernel <- function(dist_matrix, sigma) {
+  sim_matrix <- exp(-dist_matrix^2 / (2 * sigma^2))
+  return(sim_matrix)
+}
+
+library(progress)
+na_classify <- function(na_df, exp_df, dist_mtx, class_cut, k){
+  sub_af <- exp_df
+  na_pt <- which(na_df == 0, arr.ind = TRUE)
+  pb <- progress_bar$new(total = nrow(na_pt))
+  imp_vc = c()
+  for(i in 1:nrow(na_pt)){
+    na_pt[i,'col']
+    sample = colnames(na_df)[na_pt[i,'col']]
+    protein = rownames(na_df)[na_pt[i,'row']]
+    sum_total=0
+    sum_sub=0
+    
+    sigma <- dist_mtx[sample,names(sort(dist_mtx[sample,])[k+1])]
+    sim_mtx <- gaussian_kernel(dist_matrix, sigma) %>% as.matrix()
+    
+    for (smp_loop in names(sort(dist_mtx[sample,])[1:k+1])){
+      sum_total = sum_total + sim_mtx[smp_loop,sample] * exp_df[protein, smp_loop]
+      sum_sub = sum_sub + sim_mtx[smp_loop,sample]
+    }
+    imp_vl = sum_total / sum_sub
+    imp_vc <- c(imp_vc, imp_vl)
+    
+    if(abs(imp_vl) < class_cut){
+      sub_af[protein, sample] <- "biological"
+    }
+    else{
+      sub_af[protein, sample] <- "technical"
+    }
+    pb$tick()
+  }
+#  na_pt = na_pt %>% as.data.frame()
+#  na_pt$imp_vl <- imp_vc
+#  res = list(natp_df = as.data.frame(sub_af),
+ #            imp_vl = na_pt)
+ # return(res)
+  
+  na_pt = na_pt %>% as.data.frame()
+  na_pt$imp_vl <- imp_vc
+  na_pt$Protein <- rownames(na_df)[na_pt$row]
+  na_pt$Sample <- colnames(na_df)[na_pt$col]
+  na_pt <- na_pt[, c("Protein", "Sample", "imp_vl")]
+
+  res = list(natp_df = as.data.frame(sub_af),
+             imp_vl = na_pt)
+  return(res)
+}
+
+cl_test <- na_classify(ft_binarydf, ft_expdf, dist_matrix, th, k)
+
+cl_resdf <- cl_test[['natp_df']]
+proteins <- rownames(cl_resdf)
+#write.csv(cl_resdf, file = paste0(args$output_dir, "/aftercalssification_label.csv"))
+
+cl_resdf[cl_resdf != 'biological' & cl_resdf != 'technical'] <- 1
+cl_resdf[cl_resdf == 'biological'] <- 0
+cl_resdf[cl_resdf == 'technical'] <- 0.5
+cl_resdf <- lapply(as.data.frame(cl_resdf), as.numeric) %>% as.data.frame()
+rownames(cl_resdf) <- proteins
+
+heat_df <- cl_resdf[order(rowSums(cl_resdf != 1), decreasing = T),]
+
+#write.csv(heat_df, file = paste0(args$output_dir, "/aftercalssification_mtx.csv"))
+library(pheatmap)
+p <- pheatmap(as.matrix(heat_df), color = c("#1c3f58","#fbf70c","#A12D45"), cluster_rows = FALSE, cluster_cols = FALSE,  show_colnames = T,
+              show_rownames = FALSE,use_raster = F, legend = F, fontsize_col = 3)
+
+p
+#dev.off()
+#unlink("Rplots.pdf")
+```
+
+```{r}
+label_df <- cl_test$natp_df
+bio_missing_ratio <- apply(label_df, 1, function(x) sum(x == "biological") / sum(x != "1"))
+
+bio_missing_ratio_df <- data.frame(Protein = rownames(label_df),
+                                   BiologicalMissingRatio = bio_missing_ratio)
+
+miss_cor <- data.frame(
+  missing_rate    = rowSums(is.na(data_mtx[rownames(ft_expdf),])) / ncol(ft_expdf),
+  mean_abundance  = rowMeans(data_mtx[rownames(ft_expdf),], na.rm = TRUE)
+)
+
+df_input <- cbind(miss_cor, bio_missing_ratio_df)
+df_input <- df_input[,-3]
+```
+
+
+```{r}
+library(scales)
+p <- 
+  ggplot(df_input, aes(x = missing_rate, y = bio_missing_ratio)) +
+  geom_point(size = 0.8, alpha = 0.6) +
+  geom_smooth(method = "loess", se = FALSE, color = "red", linewidth = 1.2) +
+  geom_text(
+      aes(x = 0.25, y = 0.95,
+          label = 'rho = 0.95, 
+p < 0.001'),
+      size = 4.5,
+      fontface = "bold" 
+    ) +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  theme_bw() +
+  xlab("Missing Rate") +
+  ylab("Biological Missing Rate") +
+  ggtitle("Correlation in 'Dataset SCP'") +
+  theme(
+    panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+    text             = element_text(size = 13),
+    axis.text        = element_text(size = 13, face = "bold"),
+    axis.text.x      = element_text(color = "black", size = 13, face = "bold"),
+    axis.text.y      = element_text(color = "black", size = 13, face = "bold"),
+    axis.ticks.length= unit(2, "mm"),
+    axis.title       = element_text(size = 14, face = "bold"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position  = "right",
+    legend.title     = element_text(size = 13, face = "bold"),
+    legend.text      = element_text(size = 12),
+    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15),
+    strip.text       = element_text(size = 13, face = "bold")
+  )
+
+p
+
+ggsave(
+  filename = "./figure_benchmarking/BIND.tiff",  
+  plot = p,                      
+  device = "tiff",                    
+  dpi = 300,                          
+  width = 4.5,                         
+  height =4.5,                       
+  units = "in"
+)
+```
+
+```{r}
+print(with(df_input, cor.test(missing_rate, BiologicalMissingRatio, method = "spearman")))
+```
+
+```{r}
+df <- label_df %>%
+  mutate(across(everything(), ~ suppressWarnings(as.numeric(.))))
+
+df_norm <- as.data.frame(apply(df, 2, function(x) {
+                        gMedian = median(x, na.rm = TRUE)
+                        x - gMedian
+  }
+    ))
+
+miss_cor_norm <- data.frame(
+  missing_rate    = rowSums(is.na(df_norm)) / ncol(df_norm),
+  mean_abundance  = rowMeans(df_norm, na.rm = TRUE)
+)
+
+df_input <- cbind(miss_cor_norm, bio_missing_ratio_df)
+df_input <- df_input[,-3]
+```
+
+
+
+```{r}
+p2 <- 
+  ggplot(df_input, aes(x = bio_missing_ratio, y = mean_abundance)) +
+  geom_point(size = 0.8, alpha = 0.6) +
+  geom_smooth(method = "loess", se = FALSE, color = "red", linewidth = 1.2) +
+  geom_text(
+      aes(x = 0.95, y = 7,
+          label = 'rho = -0.58, 
+p < 0.001'),
+      size = 4.5,
+      fontface = "bold" 
+    ) +
+  theme_bw() +
+  ylab("Protein Abundance") +
+  xlab("Biological Missing Rate") +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_y_continuous(
+    limits = c(-5, 10),
+    expand = expansion(mult = c(0.02, 0.05))) +
+  ggtitle("Correlation in 'Dataset SCP'") +
+  theme(
+    panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+    text             = element_text(size = 13),
+    axis.text        = element_text(size = 13, face = "bold"),
+    axis.text.x      = element_text(color = "black", size = 13, face = "bold"),
+    axis.text.y      = element_text(color = "black", size = 13, face = "bold"),
+    axis.ticks.length= unit(2, "mm"),
+    axis.title       = element_text(size = 14, face = "bold"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position  = "right",
+    legend.title     = element_text(size = 13, face = "bold"),
+    legend.text      = element_text(size = 12),
+    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15),
+    strip.text       = element_text(size = 13, face = "bold")
+  ) +
+  coord_flip()
+
+p2
+
+ggsave(
+  filename = "./figure_benchmarking/BIND_Abundance.tiff",  
+  plot = p2,                      
+  device = "tiff",                   
+  dpi = 300,                          
+  width = 4.5,                        
+  height = 4.5,                       
+  units = "in"
+)
+```
+
+```{r}
+print(with(df_input, cor.test(mean_abundance, BiologicalMissingRatio, method = "spearman")))
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

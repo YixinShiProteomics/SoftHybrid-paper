@@ -7,7 +7,7 @@ output: html_document
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
-pacman::p_load(magrittr, ggplot2, ggVennDiagram, pheatmap, ggridges, umap, limma, dplyr, tidyr, viridis, gridExtra, stringr, ggsci, clusterProfiler, org.Mm.eg.db, UpSetR, missForest,ComplexHeatmap, WGCNA, org.Hs.eg.db, GOSemSim, ggrepel, VennDiagram, GSVA, tibble, purrr, scales, imputeLCMD, patchwork, mclust, cluster)
+pacman::p_load(magrittr, ggplot2, ggVennDiagram, pheatmap, ggridges, umap, limma, dplyr, tidyr, viridis, gridExtra, stringr, ggsci, clusterProfiler, org.Mm.eg.db, UpSetR, missForest,ComplexHeatmap, WGCNA, org.Hs.eg.db, GOSemSim, ggrepel, VennDiagram, GSVA, tibble, purrr, scales, imputeLCMD, patchwork, mclust, cluster, ggpubr)
 ```
 
 # Data Preperation
@@ -16,34 +16,26 @@ pacman::p_load(magrittr, ggplot2, ggVennDiagram, pheatmap, ggridges, umap, limma
 rm(list = ls())
 getwd()
 
-intensity_bulk <- read.csv("./data/report.unique_genes_matrix_50cell_n.tsv", sep = "\t", header = T)
+intensity_bulk <- read.csv("./data/report.unique_genes_matrix_50cell_n_rerun.tsv", sep = "\t", header = T)
 rownames(intensity_bulk) <- intensity_bulk$Genes
-intensity_bulk <- intensity_bulk[,-1]
-sample <- unlist(lapply(strsplit(colnames(intensity_bulk), split = '_', fixed = TRUE), function(x) x[9]))
+intensity_bulk <- intensity_bulk[,-c(1:3)]
+sample <- unlist(lapply(strsplit(colnames(intensity_bulk), split = '_', fixed = TRUE), function(x) x[12]))
 colnames(intensity_bulk) <- unlist(lapply(strsplit(sample, split = '.', fixed = TRUE), function(x) x[1]))
 demo <- intensity_bulk[,5:8]
 intensity_bulk <- cbind(demo, intensity_bulk[,-c(5:8)])
-
-filter_protein <- rownames(intensity_bulk)[!grepl("KRT", rownames(intensity_bulk))]
-filter_protein <- filter_protein[!filter_protein %in% c("CSTA", "CDSN", "CASP14", "HRNR", "CST6", "KPRP", "FLG2", "EVPL", "IVL", "PKP1")]
-intensity_bulk <- intensity_bulk[filter_protein,]
 ```
 
 ```{r}
-intensity_scp <- read.csv("./data/report.unique_genes_matrix_1cell_n.tsv", sep = "\t", header = T)
+intensity_scp <- read.csv("./data/report.unique_genes_matrix_1cell_n_rerun.tsv", sep = "\t", header = T)
 rownames(intensity_scp) <- intensity_scp$Genes
-intensity_scp <- intensity_scp[,-1]
-sample <- unlist(lapply(strsplit(colnames(intensity_scp), split = '_', fixed = TRUE), function(x) x[9]))
-group <- unlist(lapply(strsplit(colnames(intensity_scp), split = '_', fixed = TRUE), function(x) x[5]))
+intensity_scp <- intensity_scp[,-c(1:3)]
+sample <- unlist(lapply(strsplit(colnames(intensity_scp), split = '_', fixed = TRUE), function(x) x[12]))
+group <- unlist(lapply(strsplit(colnames(intensity_scp), split = '_', fixed = TRUE), function(x) x[6]))
 colnames(intensity_scp) <- unlist(lapply(strsplit(sample, split = '.', fixed = TRUE), function(x) x[1]))
 
 demoGSC <- intensity_scp[,21:40]
 demoAST <- intensity_scp[,1:20]
 intensity_scp <- cbind(demoGSC,demoAST,intensity_scp[,-(1:40)])
-
-filter_protein <- rownames(intensity_scp)[!grepl("KRT", rownames(intensity_scp))]
-filter_protein <- filter_protein[!filter_protein %in% c("CSTA", "CDSN", "CASP14", "HRNR", "CST6", "KPRP", "FLG2", "EVPL", "IVL", "PKP1")]
-intensity_scp <- intensity_scp[filter_protein,]
 ```
 
 ## Prepare Metadata File
@@ -58,7 +50,6 @@ metadata_bulk$ID <- apply(intensity_bulk, 2, function(x) sum(!is.na(x)))
 rownames(metadata_bulk) <- metadata_bulk$sample
 ```
 
-
 ```{r}
 metadata_scp <- data.frame("sample" = colnames(intensity_scp) %>%
                         as.factor(),"group" = rep(c("GSC", 'AST', "MAC", "MIC"), each = 20))
@@ -68,7 +59,6 @@ metadata_scp$group <- metadata_scp$group %>%
 metadata_scp$ID <- apply(intensity_scp, 2, function(x) sum(!is.na(x)))
 rownames(metadata_scp) <- metadata_scp$sample
 ```
-
 
 ## Data matrix manipulation
 ```{r}
@@ -84,7 +74,6 @@ intensity_bulk_long$group <- factor(intensity_bulk_long$group, levels = c(1,2,3,
 levels(intensity_bulk_long$group) <- c("GSC", 'AST', "MAC", "MIC")
 intensity_bulk_long$sample <- factor(intensity_bulk_long$sample, levels = metadata_bulk$sample)
 ```
-
 
 ```{r}
 intensity_scp_long <- intensity_scp %>% 
@@ -259,11 +248,15 @@ common_protein <- intersect(protein_bulk, protein_scp)
 
 df_scp <- df_scp_norm[common_protein,]
 df_bulk <- df_bulk_norm[common_protein,]
+
+save(df_bulk, file = './data/bulk_benchmarking.Rdata')
+save(metadata_bulk, file = './data/metadata_bulk_benchmarking.Rdata')
 ```
 
 # Categorize NA: class A-cell type specific protein; Class B-universal protein
 ```{r}
-## Class A protein: in at least one group, >=75% replicates are NA values and in at least one group, >=75% replicates have non-missing values
+
+## Marker Candidate protein: in at least one group, >=75% replicates are NA values and in at least one group, >=75% replicates have non-missing values
 df_stats <- df_bulk_long_norm %>%
   group_by(gene, group) %>%
   summarise(
@@ -272,12 +265,12 @@ df_stats <- df_bulk_long_norm %>%
     MeanExpr   = mean(intensity, na.rm = TRUE),
     .groups = "drop"
   )
-### Filter those gene which was detected in more than 3 replicates in at least one group
+
 marker_candidate <- vector("character")
 for (prot in common_protein) {
   prot_df <- df_stats %>% filter(gene == prot)
-  cond1 <- any(prot_df$NA_rate >= 0.75)
-  cond2 <- any(prot_df$NonNA_rate >= 0.75)
+  cond1 <- any(prot_df$NA_rate > 0.75)
+  cond2 <- any(prot_df$NonNA_rate > 0.75)
   if (cond1 && cond2) {
     marker_candidate <- c(marker_candidate, prot)
   }
@@ -291,9 +284,6 @@ marker_others <- df_bulk %>%
   filter(!rownames(.) %in% marker_candidate) %>%
   rownames(.)
 ```
-
-
-
 # Imputation Method I: Random Forest of ALL proteins
 ```{r}
 #set.seed(123)
@@ -316,7 +306,7 @@ load(file = './data/imp_all_benchmarking.Rdata')
 #  minProb_all <- impute.MinProb(
 #  df_scp,
 #  q = 0.01,
-#  tune.sigma = 0.7
+#  tune.sigma = 1
 #)
 #})
 
@@ -324,8 +314,52 @@ load(file = './data/imp_all_benchmarking.Rdata')
 load(file = './data/minProb_all_benchmarking.Rdata')
 #print(time_taken_minProb)
 ```
+# Imputation Method III: KNN of ALL proteins
+```{r}
+#set.seed(25)
 
-# Imputation Method III: combination of RF and minProb
+#time_taken_knn <- system.time({
+#  knn_impute <- impute.knn(as.matrix(df_scp), k = 10)
+#  knn_all <- as.data.frame(knn_impute[[1]])
+#})
+
+#save(knn_all, file = './data/knn_all_benchmarking.Rdata')
+load(file = './data/knn_all_benchmarking.Rdata')
+#print(time_taken_knn)
+```
+# Imputation Method IV: Gaussian sample of ALL proteins
+```{r}
+#set.seed(25)
+#gaussian_impute <- function(df, width = 0.3, downshift = 1.8) {
+#  imputed_df <- df
+#  all_values <- unlist(df)
+#  observed_values <- all_values[!is.na(all_values)]
+  
+#  mu <- mean(observed_values, na.rm = TRUE)
+#  sigma <- sd(observed_values, na.rm = TRUE)
+  
+#  impute_mean <- mu - downshift * sigma
+#  impute_sd <- sigma * width
+  
+#  for (i in 1:nrow(df)) {
+#    for (j in 1:ncol(df)) {
+#      if (is.na(df[i, j])) {
+#        imputed_df[i, j] <- rnorm(1, mean = impute_mean, sd = impute_sd)
+#      }
+#    }
+#  }
+#  return(imputed_df)
+#}
+
+#time_taken_GS <- system.time({
+#  GS_all <- gaussian_impute(df_scp)
+#})
+
+#save(GS_all, file = './data/GS_All_benchmarking.Rdata')
+load(file = './data/GS_All_benchmarking.Rdata')
+#print(time_taken_GS)
+```
+# Imputation Method V: Soft Hybrid Imputation
 ## Assessment of missing rate
 ```{r}
 miss_cor <- data.frame(
@@ -341,7 +375,6 @@ ggplot(miss_cor, aes(x = missing_rate, y = mean_abundance)) +
   ylab("Mean log2 Abundance") +
   ggtitle("Correlation of Abundance and Missing Rate")
 ```
-
 ```{r}
 library(ggplot2)
 library(scales)
@@ -402,7 +435,7 @@ find_missing_rate_elbow <- function(df_norm,
                                     point_alpha = 0.8,
                                     save_path = NULL,   
                                     group_name = NULL,
-                                    tiff_width = 6,  
+                                    tiff_width = 4,  
                                     tiff_height = 3.5,
                                     tiff_dpi = 600) {
   
@@ -489,95 +522,15 @@ find_missing_rate_elbow <- function(df_norm,
   )
 }
 
-res_scp <- find_missing_rate_elbow(df_scp, span = 0.75,
-                                        save_path = "./figure_benchmarking/scp_elbow.tiff")
+res_scp <- find_missing_rate_elbow(df_scp, span = 0.75, tiff_width = 4.5, tiff_height = 4.5,
+                                   save_path = "./figure_benchmarking/scp_elbow.tiff")
 
 res_scp$plot
 ```
 
-## Imputation Method III: Hybrid at Elbow point
-```{r, warning=FALSE}
-#missing_rate <- rowSums(is.na(df_scp)) / ncol(df_scp)
-#thr <- 0.25
-#genes_low  <- names(missing_rate)[missing_rate <= thr]
-#genes_high <- names(missing_rate)[missing_rate >  thr]
-#df_low  <- df_scp[genes_low, , drop=FALSE]
-#df_high <- df_scp[genes_high, , drop=FALSE]
-
-#time_taken_Hybrid <- system.time({
-#  set.seed(123)
-#  res_low  <- missForest(as.data.frame(df_low), verbose=FALSE)
-#  imp_low  <- res_low$ximp
-#  save(imp_low, file = './data/imp_low_benchmarking.Rdata')
-#  load(file = './data/imp_low_benchmarking.Rdata')
-
-#  set.seed(25)
-#  imp_high <- impute.MinProb(
-#    df_high,
-#    q = 0.01,
-#    tune.sigma = 0.7
-#  )
-#  imp_combo <- rbind(imp_low, imp_high)
-#})
-
-#save(imp_combo, file = './data/imp_combo_benchmarking.Rdata')
-load(file = './data/imp_combo_benchmarking.Rdata')
-#print(time_taken_Hybrid)
-```
-
-# Imputation Method IV: KNN of ALL proteins
-```{r}
-#set.seed(25)
-
-#time_taken_knn <- system.time({
-#  knn_impute <- impute.knn(as.matrix(df_scp), k = 5)
-#  knn_all <- as.data.frame(knn_impute[[1]])
-#})
-
-#save(knn_all, file = './data/knn_all_benchmarking.Rdata')
-load(file = './data/knn_all_benchmarking.Rdata')
-#print(time_taken_knn)
-```
-
-
-# Imputation Method V: Gaussian sample of ALL proteins
-```{r}
-#set.seed(25)
-#gaussian_impute <- function(df, width = 0.3, downshift = 1.8) {
-#  imputed_df <- df
-#  all_values <- unlist(df)
-#  observed_values <- all_values[!is.na(all_values)]
-  
-#  mu <- mean(observed_values, na.rm = TRUE)
-#  sigma <- sd(observed_values, na.rm = TRUE)
-  
-#  impute_mean <- mu - downshift * sigma
-#  impute_sd <- sigma * width
-  
-#  for (i in 1:nrow(df)) {
-#    for (j in 1:ncol(df)) {
-#      if (is.na(df[i, j])) {
-#        imputed_df[i, j] <- rnorm(1, mean = impute_mean, sd = impute_sd)
-#      }
-#    }
-#  }
-#  return(imputed_df)
-#}
-
-#time_taken_GS <- system.time({
-#  GS_all <- gaussian_impute(df_scp)
-#})
-
-#save(GS_all, file = './data/GS_All_benchmarking.Rdata')
-load(file = './data/GS_All_benchmarking.Rdata')
-#print(time_taken_GS)
-```
-
-
-# Imputation Method VI: Soft Hybrid Imputation
 ```{r}
 soft_hybrid_impute <- function(df_rf, df_minProb, df_raw, 
-                               r0 = NULL, x0 = NULL, a = 10, b = 5, lambda = 0.5,
+                               r0 = NULL, x0 = NULL, a = 10, b = 5, lambda = 0.4,
                                visualize = TRUE) {
   stopifnot(all(dim(df_rf) == dim(df_minProb)))
   stopifnot(all(rownames(df_rf) == rownames(df_minProb)))
@@ -647,17 +600,13 @@ soft_hybrid_impute <- function(df_rf, df_minProb, df_raw,
 ```
 
 ```{r}
-df_imp_soft <- soft_hybrid_impute(imp_all, minProb_all, df_scp, lambda = 0.5)
+df_imp_soft <- soft_hybrid_impute(imp_all, minProb_all, df_scp, lambda = 0.4)
 save(df_imp_soft, file = './data/SoftHybridImputation_benchmarking.Rdata')
 load(file = './data/SoftHybridImputation_benchmarking.Rdata')
 ```
-
-
-
-## Assessment of three imputation methods
+## Assessment of different imputation methods
 ```{r}
 df_truth <- df_bulk %>%
-  filter(rownames(.) %in% marker_others) %>%
   mutate(gene = rownames(.)) %>%
   pivot_longer(cols = colnames(df_bulk), 
                names_to = "sample", 
@@ -685,8 +634,6 @@ imp_all_uni <- imp_all %>%
   filter(rownames(.) %in% test)
 minProb_all_uni <- minProb_all %>%
   filter(rownames(.) %in% test)
-imp_combo_uni <- imp_combo %>%
-  filter(rownames(.) %in% test)
 knn_all_uni <- knn_all %>%
   filter(rownames(.) %in% test)
 GS_all_uni <- GS_all %>%
@@ -694,345 +641,332 @@ GS_all_uni <- GS_all %>%
 imp_soft_uni <- df_imp_soft %>%
   filter(rownames(.) %in% test)
 ```
-
+### Table Organisation
 ```{r}
-imp_list <- list(
-  RF     = imp_all_uni,
-  minProb = minProb_all_uni,
-  KNN    = knn_all_uni,
-  Gaussian  = GS_all_uni,
+method_levels <- c("Gaussian", "KNN", "minProb", "RF", "SoftHybrid")
+
+method_colors <- c(
+  "Gaussian"   = "#E69F00",
+  "KNN"        = "#56B4E9",
+  "minProb"    = "#D55E00",
+  "RF"         = "#009E73",
+  "SoftHybrid" = "#9966CC"
+)
+
+imp_list_uni <- list(
+  Gaussian   = GS_all_uni,
+  KNN        = knn_all_uni,
+  minProb    = minProb_all_uni,
+  RF         = imp_all_uni,
   SoftHybrid = imp_soft_uni
+)
+
+imp_list_all <- list(
+  Gaussian   = GS_all,
+  KNN        = knn_all,
+  minProb    = minProb_all,
+  RF         = imp_all,
+  SoftHybrid = df_imp_soft
 )
 
 truth_mat <- df_satas_truth %>%
   pivot_wider(names_from = group, values_from = MeanExpr) %>%
-  column_to_rownames("gene")
-metadata_scp <- metadata_scp %>% filter(sample %in% colnames(imp_all_uni))
+  column_to_rownames("gene") %>%
+  as.matrix()
+
+metadata_use <- metadata_scp %>%
+  filter(sample %in% colnames(imp_list_uni$RF)) %>%
+  mutate(group = factor(group, levels = c("GSC", "AST", "MAC", "MIC")))
 ```
-
-
+### Sample-wise AE and Spearman correlation
 ```{r}
 evaluate_universal <- function(imputed_mat, truth_mat, metadata) {
-  result_list <- list()
-  for (grp in unique(metadata$group)) {
-    samples <- metadata %>% filter(group == grp) %>% pull(sample)
-    common_genes <- intersect(rownames(imputed_mat), rownames(truth_mat))
+  
+  common_genes <- intersect(rownames(imputed_mat), rownames(truth_mat))
+  common_samples <- intersect(colnames(imputed_mat), metadata$sample)
+  
+  imputed_mat <- imputed_mat[common_genes, common_samples, drop = FALSE]
+  metadata_sub <- metadata %>% filter(sample %in% common_samples)
+  
+  result_list <- lapply(unique(metadata_sub$group), function(grp) {
+    
+    samples_grp <- metadata_sub %>%
+      filter(group == grp) %>%
+      pull(sample)
+    
     truth_vec <- truth_mat[common_genes, grp]
-    expr_mat  <- imputed_mat[common_genes, samples]
-    stats <- apply(expr_mat, 2, function(x) {
-      list(
+    expr_mat  <- imputed_mat[common_genes, samples_grp, drop = FALSE]
+    
+    df_stat <- lapply(colnames(expr_mat), function(smp) {
+      x <- expr_mat[, smp]
+      data.frame(
+        Sample   = smp,
+        group    = grp,
         RMSE     = sqrt(mean((x - truth_vec)^2, na.rm = TRUE)),
-        MAE      = mean(abs(x - truth_vec), na.rm = TRUE),
-        Pearson  = cor(x, truth_vec, method = "pearson", use = "complete.obs"),
+        AE       = mean(abs(x - truth_vec), na.rm = TRUE),
+        Pearson  = cor(x, truth_vec, method = "pearson",  use = "complete.obs"),
         Spearman = cor(x, truth_vec, method = "spearman", use = "complete.obs")
       )
-    })
-    df_stat <- bind_rows(stats, .id = "Sample") %>%
-      mutate(group = grp)
-    result_list[[grp]] <- df_stat
-  }
+    }) %>% bind_rows()
+    
+    df_stat
+  })
+  
   bind_rows(result_list)
 }
-result_combined <- map2_dfr(imp_list, names(imp_list), ~{
-  df <- evaluate_universal(.x, truth_mat, metadata_scp)
+
+recovery_results <- map2_dfr(imp_list_all, names(imp_list_all), ~{
+  df <- evaluate_universal(.x, truth_mat, metadata_use)
   df$Method <- .y
   df
 })
+
+recovery_results$Method <- factor(recovery_results$Method, levels = method_levels)
 ```
-
-
+### Repeated ARI and NMI
 ```{r}
-method_colors <- c(
-   "RF"         = "#009E73",  
-  "minProb"    = "#D55E00",  
-  "Gaussian"   = "#E69F00",  
-  "KNN"        = "#56B4E9",  
-  "SoftHybrid" = "#9966CC"  
-)
-
-plot_data <- result_combined %>%
-  group_by(Method) %>%
-  summarise(
-    MAE_mean = mean(MAE, na.rm = TRUE),
-    MAE_sd = sd(MAE, na.rm = TRUE)
-  ) 
-
-pMAE <- 
-  ggplot(plot_data, aes(x = Method, y = MAE_mean, fill = Method)) +
-  geom_col(width = 0.7, alpha = 0.9) +
-  geom_errorbar(aes(ymin = MAE_mean - MAE_sd, ymax = MAE_mean + MAE_sd),
-                width = 0.2, color = "black") +
-  geom_text(aes(label = sprintf("%.4f", MAE_mean), 
-                y = MAE_mean + MAE_sd + 0.1), 
-            size = 4.5,
-            fontface = "bold" ) +
-  scale_fill_manual(values = method_colors)  +
-  theme_bw() +
-  labs(
-       x = "Imputation Method",
-       y = "MAE") +
-  theme(
-    panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.6),
-    text = element_text(size = 13),
-    axis.text = element_text(size = 13, face = "bold"),
-    axis.text.x = element_blank(),
-    axis.ticks.length= unit(2, "mm"),
-    axis.title = element_text(size = 14, face = "bold"),
-    panel.grid.major = element_blank(),
-    panel.grid.minor = element_blank(),
-    legend.position  = "right",
-    legend.title = element_text(size = 13, face = "bold"),
-    legend.text  = element_text(size = 12),
-    plot.title = element_text(hjust = 0.5, face = "bold", size = 15)  
+calc_cluster_metrics_once <- function(expr_mat, metadata, k = 4, prop = 0.8, seed = 123) {
+  set.seed(seed)
+  
+  samples_keep <- sample(metadata$sample, size = ceiling(nrow(metadata) * prop), replace = FALSE)
+  meta_sub <- metadata %>% filter(sample %in% samples_keep)
+  
+  expr_sub <- expr_mat[, meta_sub$sample, drop = FALSE]
+  
+  pca <- prcomp(t(expr_sub), scale. = TRUE)
+  pca_coord <- pca$x[, 1:min(10, ncol(pca$x)), drop = FALSE]
+  
+  km <- kmeans(pca_coord, centers = k, nstart = 50)
+  
+  true_label <- as.character(meta_sub$group)
+  pred_label <- as.character(km$cluster)
+  
+  data.frame(
+    ARI = adjustedRandIndex(true_label, pred_label),
+    NMI = aricode::NMI(true_label, pred_label)
   )
+}
 
-pMAE
-```
+calc_cluster_metrics_repeat <- function(expr_mat, metadata, k = 4, prop = 0.8, n_repeat = 20, seed = 123) {
+  map_dfr(seq_len(n_repeat), function(i) {
+    out <- calc_cluster_metrics_once(
+      expr_mat = expr_mat,
+      metadata = metadata,
+      k = k,
+      prop = prop,
+      seed = seed + i
+    )
+    out$Replicate <- i
+    out
+  })
+}
 
-```{r}
-colnames(result_combined) <- c('Sample', 'RMSE', 'MAE', 'Pearson', 'Spearman', 'group', 'Method')
-
-plot_data <- result_combined %>%
-  group_by(Method) %>%
-  summarise(
-    Pearson_mean = mean(Pearson, na.rm = TRUE),
-    Pearson_sd = sd(Pearson, na.rm = TRUE)
-  ) 
-
-pPearson <- 
-  ggplot(plot_data, aes(x = Method, y = Pearson_mean, fill = Method)) +
-  geom_col(width = 0.7, alpha = 0.9) +
-  geom_errorbar(aes(ymin = Pearson_mean - Pearson_sd, ymax = Pearson_mean + Pearson_sd),
-                width = 0.2, color = "black") +
-  geom_text(aes(label = sprintf("%.4f", Pearson_mean), 
-                y = Pearson_mean + Pearson_sd + 0.02),  
-            size = 4.5,
-    fontface = "bold" ) +
-  scale_fill_manual(values = method_colors) +
-  theme_bw() +
-  labs(
-       x = "Imputation Method",
-       y = "Pearson Correlation") +
-  theme(
-    panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
-    text = element_text(size = 13),
-    axis.text = element_text(size = 13, face = "bold"),
-    axis.text.x = element_blank(),
-    axis.ticks.length= unit(2, "mm"),
-    axis.title = element_text(size = 14, face = "bold"),
-    panel.grid.major = element_blank(),
-    panel.grid.minor = element_blank(),
-    legend.position  = "right",
-    legend.title = element_text(size = 13, face = "bold"),
-    legend.text  = element_text(size = 12),
-    plot.title = element_text(hjust = 0.5, face = "bold", size = 15) 
+cluster_results <- map2_dfr(imp_list_all, names(imp_list_all), ~{
+  df <- calc_cluster_metrics_repeat(
+    expr_mat  = .x,
+    metadata  = metadata_use,
+    k         = 4,
+    prop      = 0.8,
+    n_repeat  = 100,
+    seed      = 123
   )
+  df$Method <- .y
+  df
+})
 
-pPearson
+cluster_results$Method <- factor(cluster_results$Method, levels = method_levels)
 ```
-
+### Long table organisation
 ```{r}
-plot_data <- result_combined %>%
-  group_by(Method) %>%
-  summarise(
-    Spearman_mean = mean(Spearman, na.rm = TRUE),
-    Spearman_sd = sd(Spearman, na.rm = TRUE)
-  ) 
-
-pSpearman <- 
-  ggplot(plot_data, aes(x = Method, y = Spearman_mean, fill = Method)) +
-  geom_col(width = 0.7, alpha = 0.9) +
-  geom_errorbar(aes(ymin = Spearman_mean - Spearman_sd, ymax = Spearman_mean + Spearman_sd), width = 0.2, color = "black") +
-  geom_text(aes(label = sprintf("%.4f", Spearman_mean), 
-                y = Spearman_mean + Spearman_sd + 0.02), 
-            size = 4.5) +
-  scale_fill_manual(values = method_colors) +
-  theme_bw() +
-  labs(
-       x = "Imputation Method",
-       y = "Spearman Correlation") +
-  theme(
-    text = element_text(size = 12),
-    axis.text = element_text(size = 10),
-    axis.text.x = element_blank(),
-    panel.grid.major = element_blank(),
-    panel.grid.minor = element_blank(),
-    plot.title = element_text(hjust = 0.5, face = "bold", size = 14)  
-  )
-
-pSpearman
-```
-
-```{r}
-pStatCom <- pPearson/pSpearman +   
-  plot_layout(guides = "collect") +
-  plot_annotation(tag_levels = 'A') &   
-  theme(
-    plot.tag = element_text(face = "bold", size = 14),
-    plot.tag.position = c(0.02, 0.98)          
-  )
-
-pStatCom
-
-ggsave(
-  filename = "./figure_benchmarking/SCP_Correlation.tiff",  
-  plot = pStatCom,                     
-  device = "tiff",                    
-  dpi = 300,                          
-  width = 6,                        
-  height = 8,                       
-  units = "in"                       
-)
-```
-
-```{r}
-heat_long <- result_combined %>%
-  dplyr::select(Sample, Method, group, Pearson, Spearman) %>%
-  pivot_longer(c(Pearson, Spearman),
-               names_to = "Metric", values_to = "Corr") %>%
-  mutate(
-    Method = factor(Method, levels = names(method_colors)),
-    Metric = factor(Metric, levels = c("Pearson","Spearman"))
-  )
-
-heat_long <- heat_long %>%
-  filter(Metric == 'Spearman') %>%
-  group_by(Metric, Sample) %>%
-  mutate(Z = as.numeric(scale(Corr))) %>%   
-  ungroup()
-
-rng <- range(heat_long$Z, na.rm = TRUE)
-
-p_heat_samples <- ggplot(heat_long, aes(Sample, Method, fill = Z)) +
-  geom_tile(color = "white", linewidth = 0.5, height = 0.5) +
-  scale_fill_gradientn(
-    colors = c("#4575b4", "white", "#d73027"),
-    values = rescale(c(rng[1], 0, rng[2])), 
-    limits = rng,
-    name   = "Z-score"
-  ) +
-  facet_wrap(~ Metric, ncol = 1, scales = "free_y") +
-  theme_bw() +
-  theme(
-    panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
-    text             = element_text(size = 13),
-    axis.text        = element_text(size = 13, face = "bold"),
-    axis.text.x      = element_blank(),
-    axis.text.y      = element_text(color = "black", size = 13, face = "bold"), 
-    axis.ticks.length= unit(2, "mm"),
-    axis.title       = element_text(size = 14, face = "bold"),
-    panel.grid.major = element_blank(),
-    panel.grid.minor = element_blank(),
-    legend.position  = "right",
-    legend.title     = element_text(size = 13, face = "bold"),
-    legend.text      = element_text(size = 12),
-    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15),
-    strip.text       = element_text(size = 13, face = "bold") 
-  )  +
-  labs(title = "Method to Groun Truth Ranking Correlation")
-
-p_heat_samples
-
-ggsave("./figure_benchmarking/SCP_correlation_heatmap_samples.tiff", 
-       p_heat_samples,
-       device = 'tiff', 
-       width = 15, 
-       height = 2.5, units = "in",
-       dpi = 300)
-```
-
-```{r}
-heat_df <- result_combined %>%
-  group_by(Method) %>%
-  summarise(
-    Pearson  = mean(Pearson,  na.rm = TRUE),
-    Spearman = mean(Spearman, na.rm = TRUE),
-    .groups = "drop"
+plot_df_recovery <- recovery_results %>%
+  dplyr::select(Sample, group, Method, AE, Spearman) %>%
+  pivot_longer(
+    cols = c(AE, Spearman),
+    names_to = "Metric",
+    values_to = "Value"
   ) %>%
-  pivot_longer(c(Pearson, Spearman),
-               names_to = "Metric", values_to = "Mean") %>%
   mutate(
-    Method = factor(Method, levels = names(method_colors)),
-    Metric = factor(Metric, levels = c("Pearson", "Spearman"))
+    Metric = recode(
+      Metric,
+      "AE" = "AE",
+      "Spearman" = "Spearman"
+    ),
+    ID = paste(group, Sample, sep = "_")
   )
 
-heat_df_z <- heat_df %>%
+plot_df_cluster <- cluster_results %>%
+  dplyr::select(Replicate, Method, ARI, NMI) %>%
+  pivot_longer(
+    cols = c(ARI, NMI),
+    names_to = "Metric",
+    values_to = "Value"
+  ) %>%
+  mutate(
+    Metric = recode(
+      Metric,
+      "ARI" = "ARI",
+      "NMI" = "NMI"
+    ),
+    ID = paste0("Rep", Replicate)
+  )
+
+plot_df_all <- bind_rows(plot_df_recovery, plot_df_cluster) %>%
+  mutate(
+    Method = factor(Method, levels = method_levels),
+    Metric = factor(Metric, levels = c("ARI", "NMI", "AE", "Spearman"))
+  )
+```
+### Significance Test
+```{r}
+compare_vs_soft <- function(df_metric) {
+  
+  other_methods <- setdiff(method_levels, "SoftHybrid")
+  
+  res <- lapply(other_methods, function(m) {
+    df_wide <- df_metric %>%
+      filter(Method %in% c("SoftHybrid", m)) %>%
+      dplyr::select(ID, Method, Value) %>%
+      distinct() %>%
+      pivot_wider(names_from = Method, values_from = Value) %>%
+      na.omit()
+    
+    if (nrow(df_wide) < 2) {
+      pval <- NA_real_
+      n_pair <- nrow(df_wide)
+    } else {
+      pval <- wilcox.test(
+        df_wide[[m]],
+        df_wide[["SoftHybrid"]],
+        paired = TRUE,
+        exact = FALSE
+      )$p.value
+      n_pair <- nrow(df_wide)
+    }
+    
+    data.frame(
+      group1 = m,
+      group2 = "SoftHybrid",
+      p = pval,
+      N = n_pair
+    )
+  }) %>% bind_rows()
+  
+  res$p.adj <- p.adjust(res$p, method = "BH")
+  res$p.signif <- case_when(
+    is.na(res$p.adj)        ~ "ns",
+    res$p.adj < 0.0001      ~ "****",
+    res$p.adj < 0.001       ~ "***",
+    res$p.adj < 0.01        ~ "**",
+    res$p.adj < 0.05        ~ "*",
+    TRUE                    ~ "ns"
+  )
+  
+  res
+}
+
+sig_df <- plot_df_all %>%
   group_by(Metric) %>%
-  mutate(Z = as.numeric(scale(Mean))) %>%  
+  group_modify(~{
+    tmp_sig <- compare_vs_soft(.x)
+    
+    y_max <- max(.x$Value, na.rm = TRUE)
+    y_min <- min(.x$Value, na.rm = TRUE)
+    y_range <- y_max - y_min
+    
+    if (y_range == 0) y_range <- 0.1
+    
+    tmp_sig$y.position <- y_max + seq(0.08, by = 0.08, length.out = nrow(tmp_sig)) * y_range
+    tmp_sig
+  }) %>%
   ungroup()
-
-p_heat_z <- ggplot(heat_df_z, aes(Method, Metric, fill = Z)) +
-  geom_tile(color = "white", linewidth = 0.8, height = 0.5) +
-  geom_text(aes(label = sprintf("%.4f", Mean)), size = 4.2) + 
-  scale_fill_gradient2(low = "#4575b4", mid = "white", high = "#d73027",
-                       midpoint = 0, name = "Z-score") +
-  coord_fixed() +
-  theme_bw(base_size = 12) +
-  theme(
-    axis.title = element_blank(),
-    panel.grid = element_blank(),
-    legend.position = "right",
-    plot.title = element_text(hjust = 0.5, face = "bold")
-  ) +
-  ggtitle("Ranking Consistency (row-wise normalized)")
-
-p_heat_z
-
-rng <- range(heat_df$Mean, na.rm = TRUE)
-mid <- mean(rng)
-
-p_heat <- ggplot(heat_df, aes(Method, Metric, fill = Mean)) +
-  geom_tile(color = "white", linewidth = 0.8, height = 0.5) +
-  geom_text(aes(label = sprintf("%.4f", Mean)), size = 4.2) +
-  scale_fill_gradientn(
-    colors = c("#4575b4", "#ffffbf", "#d73027"),
-    values = rescale(c(rng[1], mid, rng[2])),
-    limits = rng,
-    name   = "Correlation",
-    guide  = guide_colorbar(barheight = 8, barwidth = 0.6)
-  ) +
-  coord_fixed() +
-  theme_bw(base_size = 12) +
-  theme(
-    axis.title = element_blank(),
-    panel.grid = element_blank(),
-    legend.position = "right",
-    plot.title = element_text(hjust = 0.5, face = "bold")
-  ) +
-  ggtitle("Ranking Consistency Heatmap")
-
-p_heat
-
-ggsave("./figure_benchmarking/SCP_correlation_heatmap.tiff", 
-       p_heat,
-       device = 'tiff', 
-       width = 9, 
-       height = 3, units = "in",
-       dpi = 300)
 ```
 
-## PCA of all Samples
-
+### Plotting
 ```{r}
-imp_list <- list(
-  RF     = imp_all,
-  minProb = minProb_all,
-  KNN    = knn_all,
-  Gaussian  = GS_all,
-  SoftHybrid = df_imp_soft
+p_metric_box <- ggplot(
+  plot_df_all,
+  aes(x = Method, y = Value, fill = Method)
+) +
+  geom_boxplot(
+    width = 0.65,
+    outlier.shape = NA,
+    color = "black",
+    linewidth = 0.5
+  ) +
+  stat_summary(
+    fun = mean,
+    geom = "point",
+    shape = 21,
+    size = 2.8,
+    fill = "white",
+    color = "black",
+    stroke = 0.8
+  ) +
+  stat_pvalue_manual(
+    sig_df,
+    label = "p.signif",
+    xmin = "group1",
+    xmax = "group2",
+    y.position = "y.position",
+    tip.length = 0.01,
+    bracket.size = 0.5,
+    size = 5,
+    inherit.aes = FALSE
+  ) +
+  facet_wrap(~Metric, scales = "free_y", ncol = 4) +
+  scale_fill_manual(values = method_colors) +
+  labs(
+    x = "Imputation Method",
+    y = NULL,
+    title = 'Benchmarking of SoftHybrid and commonly used methods'
+  ) +
+  theme_bw() +
+  theme(
+    panel.border      = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+    text              = element_text(size = 13),
+    axis.text         = element_text(size = 12.5, face = "bold", color = "black"),
+    axis.text.x       = element_blank(),
+    axis.title        = element_text(size = 14, face = "bold"),
+    axis.title.x      = element_blank(),
+    axis.ticks.length.y = unit(2, "mm"),
+    panel.grid.major  = element_blank(),
+    panel.grid.minor  = element_blank(),
+    legend.position   = "right",
+    legend.title      = element_text(size = 13, face = "bold"),
+    legend.text       = element_text(size = 12),
+    plot.title        = element_text(hjust = 0.5, face = "bold", size = 15),
+    strip.background  = element_rect(fill = "white", color = "black", linewidth = 0.6),
+    strip.text        = element_text(size = 13, face = "bold")
+  )
+
+p_metric_box
+```
+```{r}
+ggsave(
+  filename = "./figure_benchmarking/SHI_FourMethods.tiff",  
+  plot = p_metric_box,                      
+  device = "tiff",                    
+  dpi = 300,                         
+  width = 9.5,                         
+  height = 5.25,                        
+  units = "in"                        
 )
+```
 
-colnames(imp_list$RF) <- paste0(colnames(imp_all), '_RF')
-colnames(imp_list$minProb) <- paste0(colnames(minProb_all), '_minProb')
-colnames(imp_list$KNN) <- paste0(colnames(knn_all), '_KNN')
-colnames(imp_list$Gaussian) <- paste0(colnames(GS_all), '_Gaussian')
-colnames(imp_list$SoftHybrid) <- paste0(colnames(df_imp_soft), '_SoftHybrid')
 
-imp_list_combined <- cbind(imp_list$RF,imp_list$minProb,imp_list$KNN,imp_list$Gaussian,imp_list$SoftHybrid)
+## Cell-type-specific Protein Assessment
+```{r}
+colnames(imp_list_all$RF) <- paste0(colnames(imp_all), '_RF')
+colnames(imp_list_all$minProb) <- paste0(colnames(minProb_all), '_minProb')
+colnames(imp_list_all$KNN) <- paste0(colnames(knn_all), '_KNN')
+colnames(imp_list_all$Gaussian) <- paste0(colnames(GS_all), '_Gaussian')
+colnames(imp_list_all$SoftHybrid) <- paste0(colnames(df_imp_soft), '_SoftHybrid')
+
+imp_list_combined <- cbind(imp_list_all$RF,imp_list_all$minProb,imp_list_all$KNN,imp_list_all$Gaussian,imp_list_all$SoftHybrid)
 
 metadata_combined <- data.frame(
   'Sample' = colnames(imp_list_combined),
-  'Method' = c(rep(c('RF', 'minProb', 'KNN', 'Gaussian', 'SoftHybrid'), each = 76)),
+  'Method' = c(rep(c('RF', 'minProb', 'KNN', 'Gaussian', 'SoftHybrid'), each = 74)),
   'Group' = c(rep(metadata_scp$group, 5))
 )
 
@@ -1041,321 +975,221 @@ metadata_combined$Group <- factor(metadata_combined$Group, levels = c('GSC', 'AS
 rownames(metadata_combined) <- metadata_combined$Sample
 ```
 
-```{r,warning=FALSE}
-pca <- prcomp(x = t(imp_list_combined), center = T)
-std_explained <- pca$sdev^2 / sum(pca$sdev^2)
+```{r}
+group_col <- "Group"
 
-PC <- as.data.frame(pca$x) 
-PC$sample <- rownames(PC)
-PC <- merge(PC, metadata_combined, by.x = "sample", by.y = "row.names") %>%
-  dplyr::select(-sample)
+metadata_use <- metadata_combined %>%
+  rownames_to_column("sample")
 
-xlab <- paste0("PC1: ",round(std_explained[1]*100,1),'%')
-ylab <- paste0("PC2: ",round(std_explained[2]*100,1),'%')
-
-n_proteins <- nrow(imp_list_combined)
-title <- paste0("Comparison of three cell types")
-my_colors <- c(
-  "RF"         = "#009E73",  
-  "minProb"    = "#D55E00",  
-  "Gaussian"   = "#E69F00",  
-  "KNN"        = "#56B4E9",  
-  "SoftHybrid" = "#9966CC"  )
-
-p1 <- ggplot(data = PC, aes(x=PC1, y=PC2, color=Method, shape = Group)) +
-  geom_point(size = 2) +
-  scale_color_manual(values = my_colors) + 
-  theme_bw() +
-  xlab(xlab) +
-  ylab(ylab) +
-  theme(
-    panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
-    text             = element_text(size = 13),
-    axis.text        = element_text(size = 13, face = "bold"),
-    axis.text.x      = element_blank(),
-    axis.text.y      = element_text(color = "black", size = 13, face = "bold"), 
-    axis.ticks.length= unit(2, "mm"),
-    axis.title       = element_text(size = 14, face = "bold"),
-    panel.grid.major = element_blank(),
-    panel.grid.minor = element_blank(),
-    legend.position  = "right",
-    legend.title     = element_text(size = 13, face = "bold"),
-    legend.text      = element_text(size = 12),
-    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15), 
-    strip.text       = element_text(size = 13, face = "bold") 
+# ProteinA status
+A_stats <- df_stats %>%
+  filter(gene %in% marker_candidate) %>%
+  mutate(
+    status = case_when(
+      NonNA_rate > 0.75 ~ "expressing",
+      NA_rate    > 0.75 ~ "nonexpressing",
+      TRUE               ~ "intermediate"
+    )
   )
 
-p1
-
-ggsave(
-  filename = "./figure_benchmarking/PCA_all.tiff",  
-  plot = p1,                      
-  device = "tiff",                    
-  dpi = 300,                          
-  width = 5,                        
-  height = 4,                        
-  units = "in"                       
-)
-```
-
-
-
-### ARI Calculation
-```{r}
-calc_ari <- function(expr_mat, metadata, k = 4) {
-  pca <- prcomp(t(expr_mat), scale. = TRUE)
-  pca_coord <- pca$x[, 1:10]  
-  
-  set.seed(123)
-  km <- kmeans(pca_coord, centers = k, nstart = 50)
-  
-  true_label <- metadata$group
-  pred_label <- km$cluster
-  ari <- adjustedRandIndex(true_label, pred_label)
-  
-  return(ari)
-}
-```
-
-
-```{r}
-ari_results <- lapply(names(imp_list), function(m) {
-  mat <- imp_list[[m]]
-  ari <- calc_ari(mat, metadata_scp, k = 4)
-  data.frame(Method = m, ARI = ari)
-}) %>% bind_rows()
-
-print(ari_results)
-
-ari_results$Method <- factor(ari_results$Method, levels = c('RF', 'minProb', 'KNN', 'Gaussian', 'SoftHybrid'))
-
-my_colors <- c(
-  "Gaussian"   = "#E69F00",
-  "KNN"        = "#56B4E9",
-  "RF"         = "#009E73",
-  "SoftHybrid" = "#9966CC",
-  "minProb"    = "#D55E00"
-)
-
-pARI <- 
-ggplot(ari_results, aes(x = Method, y = ARI, fill = Method)) +
-  geom_col(width = 0.6) +
-  geom_text(aes(label = sprintf("%.2f", ARI), 
-                y = ARI + 0.02),  
-            size = 4.5,
-            fontface = "bold") +
-  scale_fill_manual(values = my_colors) +
-  theme_bw() +
-  labs(title = "ARI comparison across methods", x = "Method", y = "Adjusted Rand Index (ARI)") +
-  theme(
-    panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
-    text             = element_text(size = 13),
-    axis.text        = element_text(size = 13, face = "bold"),
-    axis.text.x      = element_blank(),
-    axis.text.y      = element_text(color = "black", size = 13, face = "bold"), 
-    axis.ticks.length= unit(2, "mm"),
-    axis.title       = element_text(size = 14, face = "bold"),
-    panel.grid.major = element_blank(),
-    panel.grid.minor = element_blank(),
-    legend.position  = "right",
-    legend.title     = element_text(size = 13, face = "bold"),
-    legend.text      = element_text(size = 12),
-    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15), 
-    strip.text       = element_text(size = 13, face = "bold") 
-  )
-pARI
-
-ggsave(
-  filename = "./figure_benchmarking/ARI_combo.tiff",  
-  plot = pARI,                      
-  device = "tiff",                    
-  dpi = 300,                          
-  width = 7,                         
-  height = 5,                        
-  units = "in"                        
-)
-```
-
-```{r}
-cor_GSC <- cor_table_1[c(1:17, 77:93, 153:169, 229:245, 305:321),c(1:17, 77:93, 153:169, 229:245, 305:321)]
-cor_AST <- cor_table_1[c(18:36, 94:112, 170:188, 246:264, 322:340),c(18:36, 94:112, 170:188, 246:264, 322:340)]
-cor_MAC <- cor_table_1[c(37:56, 113:132, 189:208, 265:284, 341:360),c(37:56, 113:132, 189:208, 265:284, 341:360)]
-cor_MIC <- cor_table_1[c(57:76, 133:152, 209:228, 285:304, 361:380),c(57:76, 133:152, 209:228, 285:304, 361:380)]
-```
-
-```{r}
-library(dplyr)
-library(tidyr)
-library(ggplot2)
-
-block_mean_cor <- function(cor_mat, block_sizes, method_names = NULL, group_name = NA) {
-  stopifnot(nrow(cor_mat) == sum(block_sizes), ncol(cor_mat) == sum(block_sizes))
-  k <- length(block_sizes)
-  if (is.null(method_names)) method_names <- paste0("Method", seq_len(k))
-  ends   <- cumsum(block_sizes)
-  starts <- c(1, head(ends, -1) + 1)
-  idx_list <- Map(function(s, e) seq.int(s, e), starts, ends)
-  out <- list()
-  for (i in seq_len(k)) {
-    for (j in seq_len(k)) {
-      subm <- cor_mat[idx_list[[i]], idx_list[[j]], drop = FALSE]
-      if (i == j) {
-        subm <- subm[upper.tri(subm) | lower.tri(subm)]
-      }
-      mval <- mean(subm, na.rm = TRUE)
-      out[[length(out) + 1]] <- data.frame(
-        Group  = group_name,
-        Method1 = method_names[i],
-        Method2 = method_names[j],
-        MeanCor = mval,
-        stringsAsFactors = FALSE
-      )
-    }
-  }
-  dplyr::bind_rows(out)
-}
-```
-
-```{r}
-method_names <- c('RF', 'minProb', 'KNN', 'Gaussian', 'SoftHybrid')
-n_GSC <- c(17, 17, 17, 17, 17)
-n_AST <- c(19, 19, 19, 19, 19)
-n_MAC <- c(20, 20, 20, 20, 20)
-n_MIC <- c(20, 20, 20, 20, 20)
-
-res_GSC <- block_mean_cor(cor_GSC, n_GSC, method_names, group_name = "GSC")
-res_AST <- block_mean_cor(cor_AST, n_AST, method_names, group_name = "AST")
-res_MAC <- block_mean_cor(cor_MAC, n_MAC, method_names, group_name = "MAC")
-res_MIC <- block_mean_cor(cor_MIC, n_MIC, method_names, group_name = "MIC")
-
-res_all <- dplyr::bind_rows(res_GSC, res_AST, res_MAC, res_MIC)
-```
-
-```{r}
-ggplot(res_GSC, aes(x = Method1, y = Method2, fill = MeanCor)) +
-  geom_tile() +
-  geom_text(aes(label = sprintf("%.2f", MeanCor)), size = 4.5, fontface = "bold") +
-  scale_fill_gradient2(low = "#4575b4", mid = "white", high = "#d73027",  midpoint = 0.8) +
-  coord_fixed() +
-  theme_bw() +
-  labs(title = "Method-to-Method Mean Correlation (GSC)", x = "", y = "") +
-  theme(
-    panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
-    text             = element_text(size = 13),
-    axis.text        = element_text(size = 13, face = "bold"),
-    axis.text.x      = element_blank(),
-    axis.text.y      = element_text(color = "black", size = 13, face = "bold"), 
-    axis.ticks.length= unit(2, "mm"),
-    axis.title       = element_text(size = 14, face = "bold"),
-    panel.grid.major = element_blank(),
-    panel.grid.minor = element_blank(),
-    legend.position  = "right",
-    legend.title     = element_text(size = 13, face = "bold"),
-    legend.text      = element_text(size = 12),
-    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15),
-    strip.text       = element_text(size = 13, face = "bold") 
-  )
-```
-
-```{r}
-pCorCombo <- 
-ggplot(res_all, aes(x = Method1, y = Method2, fill = MeanCor)) +
-  geom_tile() +
-  geom_text(aes(label = sprintf("%.2f", MeanCor)), size = 4.5, fontface = "bold") +
-  scale_fill_gradient2(low = "#4575b4", mid = "white", high = "#d73027",  midpoint = 0.8) +
-  coord_fixed() +
-  theme_bw() +
-  labs(title = "Method-to-Method Mean Correlation by Group", x = "", y = "") +
-  facet_wrap(~ Group, ncol = 2) +
-  theme(
-    panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
-    text             = element_text(size = 13),
-    axis.text        = element_text(size = 13, face = "bold"),
-    axis.text.x      = element_text(color = "black", size = 13, face = "bold", angle = 45, hjust = 1),
-    axis.text.y      = element_text(color = "black", size = 13, face = "bold"), 
-    axis.ticks.length= unit(2, "mm"),
-    axis.title       = element_text(size = 14, face = "bold"),
-    panel.grid.major = element_blank(),
-    panel.grid.minor = element_blank(),
-    legend.position  = "right",
-    legend.title     = element_text(size = 13, face = "bold"),
-    legend.text      = element_text(size = 12),
-    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15), 
-    strip.text       = element_text(size = 13, face = "bold") 
-  )
-pCorCombo
-
-ggsave(
-  filename = "./figure_benchmarking/SCP_Correlation_combo.tiff",  
-  plot = pCorCombo,                     
-  device = "tiff",                   
-  dpi = 300,                          
-  width = 9,                         
-  height = 6,                        
-  units = "in"                        
-)
-```
-
-```{r}
-res_all_mean <- res_all %>%
-  filter(Method1 == Method2) %>%
-    group_by(Method1) %>%
+# bulk map for Class A proteins
+A_map <- A_stats %>%
+  filter(status %in% c("expressing", "nonexpressing")) %>%
+  group_by(gene) %>%
   summarise(
-    Cor_mean = mean(MeanCor, na.rm = TRUE)
-  ) 
-heat_df <- result_combined %>%
-  group_by(Method) %>%
-  summarise(
-    Pearson  = mean(Pearson,  na.rm = TRUE),
-    Spearman = mean(Spearman, na.rm = TRUE),
+    expressing_groups    = list(unique(group[status == "expressing"])),
+    nonexpressing_groups = list(unique(group[status == "nonexpressing"])),
+    bulk_expr_mean = mean(MeanExpr[status == "expressing"], na.rm = TRUE),
+    bulk_expr_max  = max(MeanExpr[status == "expressing"], na.rm = TRUE),
     .groups = "drop"
   ) %>%
-  pivot_longer(c(Pearson, Spearman),
-               names_to = "Metric", values_to = "Mean") %>%
-  mutate(
-    Method = factor(Method, levels = names(method_colors)),
-    Metric = factor(Metric, levels = c("Pearson", "Spearman"))
+  filter(
+    is.finite(bulk_expr_mean),
+    !is.na(bulk_expr_mean),
+    lengths(expressing_groups) > 0,
+    lengths(nonexpressing_groups) > 0
+  )
+
+bulk_ref_A <- A_map %>%
+  dplyr::select(
+    gene,
+    bulk_expr_mean,
+    bulk_expr_max
   )
 ```
 
+```{r}
+calc_fc_imp_one_method <- function(mat, metadata_tbl, A_map_tbl,
+                                   group_col = "Group",
+                                   method_name = NA_character_) {
+  samples_use <- intersect(colnames(mat), metadata_tbl$sample)
+
+  if (length(samples_use) < 3) {
+    warning(paste0("Method ", method_name, ": matched samples < 3; returning empty."))
+    return(tibble(
+      gene = character(),
+      Method = character(),
+      imp_expr_mean = numeric(),
+      imp_nonexpr_mean = numeric(),
+      FC_imp = numeric()
+    ))
+  }
+
+  mat2 <- mat[, samples_use, drop = FALSE]
+
+  md2 <- metadata_tbl[metadata_tbl$sample %in% samples_use, , drop = FALSE]
+  md2 <- md2[match(samples_use, md2$sample), , drop = FALSE]
+
+  mat2 <- mat2[, md2$sample, drop = FALSE]
+
+  df_long <- as.data.frame(mat2) %>%
+    rownames_to_column("gene") %>%
+    pivot_longer(
+      cols = -gene,
+      names_to = "sample",
+      values_to = "expr"
+    ) %>%
+    left_join(md2[, c("sample", group_col)], by = "sample")
+
+  df_long$group_sc <- df_long[[group_col]]
+
+  sc_means <- df_long %>%
+    group_by(gene, group_sc) %>%
+    summarise(
+      mean_expr = mean(expr, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  res <- A_map_tbl %>%
+    dplyr::select(gene, expressing_groups, nonexpressing_groups) %>%
+    rowwise() %>%
+    mutate(
+      imp_expr_mean = {
+        eg <- unlist(expressing_groups)
+        vals <- sc_means$mean_expr[
+          sc_means$gene == gene & sc_means$group_sc %in% eg
+        ]
+        if (length(vals) == 0 || all(is.na(vals))) NA_real_ else mean(vals, na.rm = TRUE)
+      },
+      imp_nonexpr_mean = {
+        ng <- unlist(nonexpressing_groups)
+        vals <- sc_means$mean_expr[
+          sc_means$gene == gene & sc_means$group_sc %in% ng
+        ]
+        if (length(vals) == 0 || all(is.na(vals))) NA_real_ else mean(vals, na.rm = TRUE)
+      }
+    ) %>%
+    ungroup() %>%
+    mutate(
+      FC_imp = imp_expr_mean - imp_nonexpr_mean,
+      Method = method_name
+    ) %>%
+    dplyr::select(
+      gene, Method,
+      imp_expr_mean, imp_nonexpr_mean, FC_imp
+    )
+
+  res
+}
+```
 
 ```{r}
-spearman_df <- heat_df %>%
-  filter(Metric == 'Spearman')
-
-rownames(spearman_df) <- spearman_df$Method
-rownames(ari_results) <- ari_results$Method
-rownames(res_all_mean) <- res_all_mean$Method1
-colnames(res_all_mean) <- 'Method'
-MethodOrd <- c('RF', 'minProb', 'KNN', 'Gaussian', 'SoftHybrid')
-spearman_df <- spearman_df[MethodOrd,]
-ari_results <- ari_results[MethodOrd,]
-res_all_mean <- res_all_mean[MethodOrd,]
-colnames(res_all_mean)[2] <- 'Mean'
-
-all_metrics <- data.frame(
-  'Method' = c(rep(MethodOrd, 3)),
-  'Metric' = c(rep(c('Spearman', 'ARI', 'RepCor'), each = 5)),
-  'Value' = c(spearman_df$Mean, ari_results$ARI, res_all_mean$Mean)
+fc_imp_all <- imap_dfr(
+  imp_list_all,
+  ~ calc_fc_imp_one_method(
+    mat = .x,
+    metadata_tbl = metadata_use,
+    A_map_tbl = A_map,
+    group_col = group_col,
+    method_name = .y
+  )
 )
 
+fc_compare_all <- fc_imp_all %>%
+  left_join(bulk_ref_A, by = "gene") %>%
+  mutate(
+    preservation = FC_imp / bulk_expr_mean
+  ) %>%
+  filter(
+    is.finite(FC_imp),
+    is.finite(bulk_expr_mean)
+  )
+```
 
-all_metrics <- all_metrics %>%
-  group_by(Metric) %>%
-  mutate(Value_scaled = (Value - min(Value)) / (max(Value) - min(Value))) %>%
-  ungroup()
+```{r}
+fc_compare_all$Method <- factor(
+  fc_compare_all$Method,
+  levels = c("Raw", "Gaussian", "KNN", "minProb", "RF", "SoftHybrid")
+)
 
-pSCP_combo <- 
-ggplot(all_metrics, aes(x = Metric, Method, 
-                        y = Method, 
-                        fill = Value_scaled)) +
-  geom_tile(color = "white", height = 0.6) +
-  geom_text(aes(label = sprintf("%.2f", Value)), size = 4.5, fontface = "bold" ) +
-  scale_fill_gradient2(low = "#4575b4", mid = "white", high = "#d73027",  midpoint = 0.5) +
-  theme_bw() +
-  labs(title = "Comparison of Imputation Methods in the Single-cell Dataset",
-       x = "Metric", y = "Method", fill = "Value") +
- theme(
+cor_summary <- fc_compare_all %>%
+  group_by(Method) %>%
+  summarise(
+    spearman_rho = cor(
+      bulk_expr_mean, FC_imp,
+      method = "spearman",
+      use = "complete.obs"
+    ),
+    pearson_r = cor(
+      bulk_expr_mean, FC_imp,
+      method = "pearson",
+      use = "complete.obs"
+    ),
+    n = sum(complete.cases(bulk_expr_mean, FC_imp)),
+    .groups = "drop"
+  )
+
+cor_summary
+```
+```{r}
+cor_label_df <- fc_compare_all %>%
+  group_by(Method) %>%
+  summarise(
+    rho = cor(
+      bulk_expr_mean, FC_imp,
+      method = "spearman",
+      use = "complete.obs"
+    ),
+    x_pos = -4,
+    y_pos = 5,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    label = paste0("rho = ", round(rho, 3))
+  )
+
+method_colors <- c(
+  "Gaussian"   = "#E69F00",
+  "KNN"        = "#56B4E9",
+  "minProb"    = "#D55E00",
+  "RF"         = "#009E73",
+  "SoftHybrid" = "#9966CC"
+)
+
+p_fc_vs_bulkexpr_lab <- ggplot(
+  fc_compare_all,
+  aes(x = bulk_expr_mean, y = FC_imp, color = Method)
+) +
+  geom_point(alpha = 0.7, size = 1.5) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 0.8) +
+  geom_text(
+    data = cor_label_df,
+    aes(x = x_pos, y = y_pos, label = label),
+    inherit.aes = FALSE,
+    hjust = 0,
+    vjust = 1,
+    size = 5.5,
+    fontface = "bold"
+  ) +
+  scale_color_manual(values = method_colors) +
+  facet_wrap(~ Method, scales = "fixed", ncol = 3) +
+  labs(
+    x = "Bulk mean expression in expressing cell type(s)",
+    y = "Imputed FC 
+    (expressing vs non-expressing)"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
     panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
     text             = element_text(size = 13),
     axis.text        = element_text(size = 13, face = "bold"),
@@ -1371,20 +1205,22 @@ ggplot(all_metrics, aes(x = Metric, Method,
     plot.title       = element_text(hjust = 0.5, face = "bold", size = 15), 
     strip.text       = element_text(size = 13, face = "bold") 
   )
+  
 
-pSCP_combo
+p_fc_vs_bulkexpr_lab
 
 ggsave(
-  filename = "./figure_benchmarking/SCP_combo.tiff",  
-  plot = pSCP_combo,                      
-  device = "tiff",                    
+  filename = "./figure_benchmarking/FC_abundance_scatter.tiff",  
+  plot = p_fc_vs_bulkexpr_lab,                      
+  device = "tiff",                   
   dpi = 300,                         
-  width = 9,                         
-  height = 4,                        
-  units = "in"                        
+  width = 9,                        
+  height = 5.5,                       
+  units = "in"                     
 )
 ```
-
+# Four Imputation Method: Current Gap
+## PCA plot
 ```{r}
 imp_list <- list(
   RF     = imp_all,
@@ -1402,7 +1238,7 @@ imp_list_combined <- cbind(imp_list$RF,imp_list$minProb,imp_list$KNN,imp_list$Ga
 
 metadata_combined <- data.frame(
   'Sample' = colnames(imp_list_combined),
-  'Method' = c(rep(c('RF', 'minProb', 'KNN', 'Gaussian'), each = 76)),
+  'Method' = c(rep(c('RF', 'minProb', 'KNN', 'Gaussian'), each = 74)),
   'Group' = c(rep(metadata_scp$group, 4))
 )
 
@@ -1466,55 +1302,338 @@ ggsave(
   units = "in"                        
 )
 ```
-
-
+## PC loadings
 ```{r}
-methods_lv <- c('RF','minProb','KNN','Gaussian')
-types_lv   <- c('GSC','AST','MAC','MIC')
+loadings <- pca$rotation[,1]
+# raw missing rate
+miss_rate <- rowMeans(is.na(df_scp))
+
+df_loading <- data.frame(
+  protein = names(loadings),
+  loading = loadings,
+  abs_loading = abs(loadings),
+  miss_rate = miss_rate[names(loadings)]
+)
+
+ggplot(df_loading, aes(x = miss_rate, y = abs_loading)) +
+  geom_point(alpha=0.4) +
+  geom_smooth(method="lm", col="red") +
+  labs(x="Missing rate (raw data)",
+       y="Absolute PC1 loading")
+```
+```{r}
+# Nature-style: PC1 loading vs missing rate (clean + density contour + stats)
+
+# df_loading must contain:
+#   miss_rate   : missing rate in raw data (0-1)
+#   abs_loading : absolute PC1 loading
+stopifnot(all(c("miss_rate", "abs_loading") %in% colnames(df_loading)))
+
+# stats
+r_val <- cor(df_loading$abs_loading, df_loading$miss_rate, use = "complete.obs", method = "pearson")
+p_val <- cor.test(df_loading$abs_loading, df_loading$miss_rate, method = "pearson")$p.value
+lab   <- paste0("Pearson r = ", sprintf("%.3f", r_val), "\n",
+                "P ", ifelse(p_val < 1e-300, "< 1e-300", paste0("= ", format.pval(p_val, digits = 2, eps = 1e-300))))
+
+# dynamic label position (top-left, avoids trend line)
+x_lab <- quantile(df_loading$miss_rate, 0.03, na.rm = TRUE)
+y_lab <- quantile(df_loading$abs_loading, 0.98, na.rm = TRUE)
+
+p <- ggplot(df_loading, aes(x = miss_rate, y = abs_loading)) +
+  # dense point cloud (light)
+  geom_point(alpha = 0.12, size = 0.8, color = "black",
+             position = position_jitter(width = 0.002, height = 0)) +
+  # 2D density contours (Nature-ish)
+  #geom_density_2d(linewidth = 0.35, color = "black", alpha = 0.55) +
+  # linear fit (minimal, not overbearing)
+  geom_smooth(method = "lm", se = TRUE,
+              linewidth = 0.7, color = "#D7263D", fill = "#F4A7A7") +
+  # stats label
+  annotate("label",
+           x = x_lab, y = y_lab, label = lab,
+           hjust = 0, vjust = 1,
+           label.size = 0.25, fill = "white",
+           size = 4.2, family = "sans") +
+  scale_x_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.25), expand = expansion(mult = c(0.01, 0.01))) +
+  scale_y_continuous(expand = expansion(mult = c(0.02, 0.04))) +
+  labs(
+    title = "PC1 driven by proteins with high MR",
+    x = "Missing rate (raw data)",
+    y = "Absolute PC1 loading"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+    text             = element_text(size = 13),
+    axis.text        = element_text(size = 13, face = "bold"),
+    axis.text.x      = element_text(color = "black", size = 13, face = "bold"),
+    axis.text.y      = element_text(color = "black", size = 13, face = "bold"), 
+    axis.ticks.length= unit(2, "mm"),
+    axis.title       = element_text(size = 14, face = "bold"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position  = "right",
+    legend.title     = element_text(size = 13, face = "bold"),
+    legend.text      = element_text(size = 12),
+    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15), 
+    strip.text       = element_text(size = 13, face = "bold") 
+  )
+
+print(p)
+```
+
+## Mantel test
+```{r}
+library(vegan)
+library(dplyr)
+library(ggplot2)
+library(forcats)
+
+# 1) raw observed distance: use pairwise complete correlation (cell-cell)
+cor_raw <- cor(df_scp, use = "pairwise.complete.obs", method = "pearson")
+D_raw   <- as.dist(1 - cor_raw)
+
+# 2) Mantel per method
+mantel_df <- lapply(names(imp_list), function(m){
+  cor_m <- cor(imp_list[[m]], use = "everything", method = "pearson")  # no NA expected
+  D_m   <- as.dist(1 - cor_m)
+
+  mt <- vegan::mantel(D_raw, D_m, method = "spearman", permutations = 999)
+
+  data.frame(
+    method   = m,
+    mantel_r = unname(mt$statistic),
+    p        = mt$signif
+  )
+}) %>% bind_rows() %>%
+  mutate(
+    method = fct_reorder(method, mantel_r),
+    p_lab  = "P<0.001"
+  )
+
+# 3) Visualization: ranked bar + point + p label
+p_mantel <- 
+ggplot(mantel_df, aes(x = method, y = mantel_r, fill = method)) +
+  geom_col(width = 0.72, alpha = 0.85) +
+  geom_point(size = 2.2) +
+  geom_text(aes(label = p_lab), hjust = -0.05, size = 3.8) +
+  coord_flip() +
+  scale_fill_manual(values = my_colors) +
+  scale_y_continuous(
+    limits = c(min(0, min(mantel_df$mantel_r) - 0.05),
+               max(mantel_df$mantel_r) + 0.08)
+  ) +
+  labs(
+    x = NULL,
+    y = "Mantel correlation (Spearman r)",
+    title = "Imputation methods preserve raw cell–cell geometry"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+    text             = element_text(size = 13),
+    axis.text        = element_text(size = 13, face = "bold"),
+    axis.text.x      = element_text(color = "black", size = 13, face = "bold"),
+    axis.text.y      = element_text(color = "black", size = 13, face = "bold"), 
+    axis.ticks.length= unit(2, "mm"),
+    axis.title       = element_text(size = 14, face = "bold"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position  = "right",
+    legend.title     = element_text(size = 13, face = "bold"),
+    legend.text      = element_text(size = 12),
+    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15), 
+    strip.text       = element_text(size = 13, face = "bold") 
+  )
+p_mantel
+```
+
+## Separated PCA plot
+```{r,warning=FALSE}
+my_colors <- c(
+  "RF"         = "#009E73",
+  "minProb"    = "#D55E00",
+  "Gaussian"   = "#E69F00",
+  "KNN"        = "#56B4E9",
+  "SoftHybrid" = "#9966CC"
+)
+
+# PCA Plotting Function
+plot_pca_one_method <- function(method_name,
+                                imp_list,
+                                metadata_df,
+                                center = TRUE,
+                                scale. = FALSE) {
+
+  mat <- imp_list[[method_name]]
+
+  samples_use <- intersect(colnames(mat), rownames(metadata_df))
+  mat <- mat[, samples_use, drop = FALSE]
+
+  sample_order <- rownames(metadata_df)[rownames(metadata_df) %in% samples_use]
+  mat <- mat[, sample_order, drop = FALSE]
+
+  pca <- prcomp(t(mat), center = center, scale. = scale.)
+
+  std_explained <- pca$sdev^2 / sum(pca$sdev^2)
+
+  PC <- as.data.frame(pca$x)
+  PC$sample <- rownames(PC)
+
+  PC <- merge(PC, metadata_df, by.x = "sample", by.y = "row.names") %>%
+    dplyr::select(-sample)
+
+  xlab <- paste0("PC1: ", round(std_explained[1] * 100, 1), "%")
+  ylab <- paste0("PC2: ", round(std_explained[2] * 100, 1), "%")
+
+  ggplot(PC, aes(x = PC1, y = PC2, shape = Group)) +
+    stat_ellipse(
+      aes(group = Group),
+      type = "t",
+      linewidth = 0.8,
+      linetype = 1,
+      color = my_colors[[method_name]],
+      level = 0.95
+    ) +
+    geom_point(
+      size = 2.5,
+      color = my_colors[[method_name]]
+    ) +
+    theme_bw() +
+    xlab(xlab) +
+    ylab(ylab) +
+    ggtitle(paste0("PCA — ", method_name)) +
+    theme(
+      panel.border      = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+      text              = element_text(size = 13),
+      axis.text         = element_text(size = 13, face = "bold"),
+      axis.text.x       = element_text(color = "black", size = 13, face = "bold"),
+      axis.text.y       = element_text(color = "black", size = 13, face = "bold"),
+      axis.ticks.length = unit(2, "mm"),
+      axis.title        = element_text(size = 14, face = "bold"),
+      panel.grid.major  = element_blank(),
+      panel.grid.minor  = element_blank(),
+      legend.position   = "right",
+      legend.title      = element_text(size = 13, face = "bold"),
+      legend.text       = element_text(size = 12),
+      plot.title        = element_text(hjust = 0.5, face = "bold", size = 15)
+    )
+}
+
+methods_use <- names(imp_list)
+
+p_list <- lapply(
+  methods_use,
+  plot_pca_one_method,
+  imp_list = imp_list,
+  metadata_df = metadata_combined
+)
+
+names(p_list) <- methods_use
+
+(p_list[["RF"]] | p_list[["minProb"]]) /
+  (p_list[["Gaussian"]] | p_list[["KNN"]])
+
+methods_use <- names(imp_list)
+
+p_list <- lapply(methods_use,
+                 plot_pca_one_method,
+                 imp_list = imp_list,
+                 metadata_df = metadata_combined)
+
+names(p_list) <- methods_use
+
+combo_pca <- (p_list[["RF"]] | p_list[["minProb"]]) / (p_list[["Gaussian"]] | p_list[["KNN"]])
+combo_pca
+
+combo <- (p / p_mantel)| combo_pca+
+  plot_annotation(tag_levels = "A") &
+  theme(
+    plot.tag = element_text(face = "bold", size = 16)
+  )
+combo
+
+ggsave(
+  filename = "./figure_benchmarking/reviewer1_1.tiff",  
+  plot = combo,                      
+  device = "tiff",                    
+  dpi = 300,                         
+  width = 15,                         
+  height = 5.25,                        
+  units = "in"                        
+)
+```
+
+## ARI/Cor Comparison
+```{r}
+calc_ari <- function(expr_mat, metadata, k = 4) {
+  pca <- prcomp(t(expr_mat), scale. = TRUE)
+  pca_coord <- pca$x  
+  
+  set.seed(123)
+  km <- kmeans(pca_coord, centers = k, nstart = 50)
+  
+  true_label <- metadata$group
+  pred_label <- km$cluster
+  ari <- adjustedRandIndex(true_label, pred_label)
+  
+  return(ari)
+}
+
+methods_lv <- c("RF", "minProb", "KNN", "Gaussian")
+types_lv   <- c("GSC", "AST", "MAC", "MIC")
 
 meta <- metadata_combined %>%
-  mutate(Method = factor(Method, levels = methods_lv),
-         Group  = factor(Group,  levels = types_lv))
-
-compute_ari_for_method <- function(expr_mat, true_labels, k = length(unique(true_labels))) {
-  X <- t(expr_mat)
-  pca <- prcomp(X)
-  var_exp <- pca$sdev^2 / sum(pca$sdev^2)
-  kpc <- 10
-  Z <- pca$x[, 1:kpc, drop = FALSE]
-  set.seed(1)
-  km <- kmeans(Z, centers = k, nstart = 50)
-  adjustedRandIndex(true_labels, km$cluster)
-}
+  mutate(
+    method = factor(Method, levels = methods_lv),
+    group  = factor(Group,  levels = types_lv)
+  )
 
 compute_within_cor_for_method <- function(expr_mat, labels) {
   C <- suppressWarnings(cor(expr_mat, method = "pearson", use = "pairwise.complete.obs"))
   smp <- colnames(expr_mat)
-  lab <- labels[match(smp, names(labels))]
+  lab <- labels[smp]
+
   n <- length(smp)
   idx <- which(upper.tri(matrix(NA, n, n)), arr.ind = TRUE)
   same_grp <- lab[idx[,1]] == lab[idx[,2]]
   vals <- C[cbind(idx[same_grp,1], idx[same_grp,2])]
+
+  if (length(vals) == 0) return(NA_real_)
   stats::median(vals, na.rm = TRUE)
 }
 
 res_list <- lapply(methods_lv, function(m) {
-  smps_m <- meta %>% filter(Method == m) %>% pull(Sample)
+  smps_m <- meta %>% filter(method == m) %>% pull(Sample)
+  
+  if (!all(smps_m %in% colnames(imp_list_combined))) {
+    stop(sprintf("Some samples for method %s are not found in imp_list_combined.", m))
+  }
+  
   expr_m <- imp_list_combined[, smps_m, drop = FALSE]
-  labs_m <- meta %>% filter(Method == m) %>% pull(Group)
-  names(labs_m) <- smps_m
-
-  ari_m <- compute_ari_for_method(expr_m, labs_m, k = length(types_lv))
+  
+  meta_m <- meta %>% filter(Method == m)
+  
+  labs_m <- meta_m %>% pull(Group) %>% as.character()
+  names(labs_m) <- meta_m$Sample
+  
+  ari_m <- calc_ari(expr_m, meta_m, k = 4)
   cor_m <- compute_within_cor_for_method(expr_m, labs_m)
-
+  
   tibble(Method = m, ARI = ari_m, Cor = cor_m)
 })
+
 res <- bind_rows(res_list)
 
 res_long <- res %>%
   pivot_longer(cols = c(ARI, Cor), names_to = "Metric", values_to = "Value") %>%
-  mutate(Method = factor(Method, levels = methods_lv),
-         Metric = factor(Metric, levels = c("ARI","Cor")))
+  mutate(
+    Method = factor(Method, levels = methods_lv),
+    Metric = factor(Metric, levels = c("ARI", "Cor"))
+  )
+
+print(res)
+print(res_long)
 ```
 
 ```{r}
@@ -1579,5 +1698,9 @@ ggsave(
   height = 4,                       
   units = "in"                     
 )
+```
+
+```{r}
+sessionInfo()
 ```
 

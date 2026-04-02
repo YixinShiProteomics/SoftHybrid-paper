@@ -1,0 +1,1009 @@
+---
+title: "3_ParameterTuning_SCP_includeCellSpecificMarker"
+author: "Yixin Shi"
+date: "2026-03-04"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+pacman::p_load(magrittr, ggplot2, ggVennDiagram, pheatmap, ggridges, umap, limma, dplyr, tidyr, viridis, gridExtra, stringr, ggsci, clusterProfiler, UpSetR, missForest,ComplexHeatmap, WGCNA, org.Hs.eg.db, GOSemSim, ggrepel, GSVA, tibble, purrr, scales, imputeLCMD, patchwork, pROC, forcats)
+```
+
+# Working Directory
+```{r}
+rm(list = ls())
+getwd()
+```
+
+# Load files
+```{r}
+#load(file = './output_DIA/rf_results.Rdata')
+#load(file = './output_DIA/minprob_results.Rdata')
+mat <- read.csv("./data/report.unique_genes_matrix_SCP50.tsv", sep = "\t", header = T)
+rownames(mat) <- mat$Genes
+mat <- mat[,-c(1:3)]
+sample <- unlist(lapply(strsplit(colnames(mat), split = '_', fixed = TRUE), function(x) x[12]))
+sample_type <- unlist(lapply(strsplit(colnames(mat), split = '_', fixed = TRUE), function(x) x[6]))
+colnames(mat) <- unlist(lapply(strsplit(sample, split = '.', fixed = TRUE), function(x) x[1]))
+
+mr <- sum(is.na(mat))/length(as.matrix(mat))
+
+mat_log2 <- log2(mat)
+
+### Data normalization function
+median_centering <- function(df) {
+  df_norm <- as.data.frame(apply(df, 2, function(x) {
+                        gMedian = median(x, na.rm = TRUE)
+                        x - gMedian
+  }
+    ))
+  return(df_norm)
+}
+
+mat <- median_centering(mat_log2)
+```
+
+# Methods
+```{r}
+rf_fun <- function(df_raw) {
+  res_all <- missForest(as.data.frame(df_raw), verbose = FALSE)
+  res_all$ximp
+}
+
+minprob_fun <- function(df_raw) {
+  impute.MinProb(df_raw, q = 0.01, tune.sigma = 1)
+}
+
+soft_hybrid_impute <- function(df_rf, df_minProb, df_raw, 
+                               r0 = NULL, x0 = NULL, a = 10, b = 5, lambda = 0.5,
+                               visualize = TRUE, group_name = NULL,
+                               save_dir = "./SoftHybrid_DIA") {
+  stopifnot(all(dim(df_rf) == dim(df_minProb)))
+  stopifnot(all(rownames(df_rf) == rownames(df_minProb)))
+
+  missing_rate <- rowMeans(is.na(df_raw))
+  mean_intensity <- rowMeans(df_raw, na.rm = TRUE)
+  miss_cor <- data.frame(
+    missing_rate = missing_rate,
+    mean_abundance = mean_intensity
+  )
+
+  q3 <- quantile(miss_cor$missing_rate, 0.75, na.rm = TRUE)
+  skip_loess <- q3 == 0
+
+  if (skip_loess) {
+    elbow_x <- 1 / ncol(df_raw)
+    candidates <- mean_intensity[round(missing_rate, 6) == round(elbow_x, 6)]
+    if (length(candidates) == 0) {
+      elbow_y <- mean(mean_intensity, na.rm = TRUE)
+    } else {
+      elbow_y <- mean(candidates, na.rm = TRUE)
+    }
+  } else {
+    loess_fit <- loess(mean_abundance ~ missing_rate, data = miss_cor, span = 0.75)
+    x_vals <- seq(min(miss_cor$missing_rate), max(miss_cor$missing_rate), length.out = 1000)
+    y_vals <- predict(loess_fit, newdata = data.frame(missing_rate = x_vals))
+
+    x_start <- x_vals[1]; y_start <- y_vals[1]
+    x_end   <- x_vals[length(x_vals)]; y_end <- y_vals[length(y_vals)]
+    line_vec <- c(x_end - x_start, y_end - y_start)
+
+    distances <- sapply(seq_along(x_vals), function(i) {
+      point_vec <- c(x_vals[i] - x_start, y_vals[i] - y_start)
+      cross_prod <- abs(line_vec[1] * point_vec[2] - line_vec[2] * point_vec[1])
+      norm_line <- sqrt(sum(line_vec^2))
+      cross_prod / norm_line
+    })
+
+    max_index <- which.max(distances)
+    elbow_x <- x_vals[max_index]
+    elbow_y <- y_vals[max_index]
+  }
+
+  r0 <- elbow_x
+  x0 <- elbow_y
+
+  sigmoid <- function(x, k, x0) 1 / (1 + exp(-k * (x - x0)))
+
+  sigmoid_r <- sigmoid(missing_rate, k = a, x0 = r0)
+  sigmoid_x <- sigmoid(mean_intensity, k = b, x0 = x0)
+
+  p_MNAR <- sigmoid_r * (1 - lambda * sigmoid_x)
+  weight_rf <- 1 - p_MNAR
+
+  df_imp_soft <- df_rf
+  for (i in seq_len(nrow(df_rf))) {
+    w <- weight_rf[i]
+    df_imp_soft[i, ] <- w * df_rf[i, ] + (1 - w) * df_minProb[i, ]
+  }
+
+  if (visualize) {
+    library(ggplot2)
+    library(scales)
+    library(dplyr)
+
+    df_plot <- data.frame(
+      Protein = rownames(df_rf),
+      MissingRate = missing_rate,
+      MeanIntensity = mean_intensity,
+      Weight_RF = weight_rf
+    )
+
+    eps <- 0.02
+    df_mid_line <- df_plot %>%
+      filter(!is.na(Weight_RF)) %>%
+      mutate(diff = abs(Weight_RF - 0.5)) %>%
+      filter(diff < eps) %>%
+      group_by(MissingRate) %>%
+      slice_min(order_by = diff, n = 1, with_ties = FALSE) %>%
+      ungroup() %>%
+      arrange(MissingRate)
+
+    p <- ggplot(df_plot, aes(x = MissingRate, y = MeanIntensity, color = Weight_RF)) +
+      geom_point(size = 1.8, alpha = 0.85) +
+      {
+        if (nrow(df_mid_line) >= 2)
+          geom_line(
+            data = df_mid_line,
+            aes(x = MissingRate, y = MeanIntensity),
+            inherit.aes = FALSE,
+            color = "black",
+            linewidth = 1,
+            linetype = "dashed"
+          )
+      } +
+      {
+        if (nrow(df_mid_line) >= 1)
+          geom_point(
+            data = df_mid_line,
+            aes(x = MissingRate, y = MeanIntensity),
+            inherit.aes = FALSE,
+            shape = 21,
+            fill = "white",
+            color = "black",
+            size = 2.5,
+            stroke = 0.8
+          )
+      } +
+      scale_color_gradient2(
+        low = "#2166AC",    
+        mid = "#FFD700",    
+        high = "#B2182B",  
+        midpoint = 0.5,
+        limits = c(0, 1),
+        oob = scales::squish
+      ) +
+      scale_x_continuous(
+        limits = c(0, 1),
+        breaks = seq(0, 1, by = 0.25),
+        labels = percent_format(accuracy = 1)
+      ) +
+      labs(
+        title = paste0("Soft Hybrid Weights (", group_name, ")"),
+        x = "Missing Rate",
+        y = "Mean Intensity",
+        color = "RF Weight"
+      ) +
+      theme_bw() +
+      theme(
+    panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+    text             = element_text(size = 13),
+    axis.text        = element_text(size = 13, face = "bold"),
+    axis.text.x      = element_text(color = "black", size = 13, face = "bold"), 
+    axis.text.y      = element_text(color = "black", size = 13, face = "bold"), 
+    axis.ticks.length= unit(2, "mm"),
+    axis.title       = element_text(size = 14, face = "bold"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position  = "right",
+    legend.title     = element_text(size = 14, face = "bold"),
+    legend.text      = element_text(size = 13),
+    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15), 
+    strip.text       = element_text(size = 13, face = "bold") 
+  )
+
+    print(p)
+
+    if (!dir.exists(save_dir)) dir.create(save_dir, recursive = TRUE)
+    ggsave(
+      filename = file.path(save_dir, paste0(group_name, "_SoftHybrid_plot.tiff")),
+      plot = p,
+      device = "tiff",
+      dpi = 300,
+      width = 6,
+      height = 3.5,
+      units = "in"
+    )
+  }
+
+  return(df_imp_soft)
+}
+```
+
+# Masking: MAR + lowMNAR
+```{r}
+addMiss_for_tuning <- function(x,
+                               MV.rate = 0.3,
+                               MNAR.ratio = 0.5,
+                               ini.seed = 233,
+                               thr_sd = 0.3) {
+  stopifnot(MV.rate >= 0, MV.rate <= 1, MNAR.ratio >= 0, MNAR.ratio <= 1)
+
+  set.seed(ini.seed)
+
+  x_mat <- as.matrix(x)
+  nr <- nrow(x_mat); nc <- ncol(x_mat)
+
+  obs_idx <- which(!is.na(x_mat))
+  N_obs <- length(obs_idx)
+  if (N_obs == 0) stop("No observed values in x.")
+
+  target_total <- floor(N_obs * MV.rate)
+  target_mnar  <- floor(target_total * MNAR.ratio)
+  target_mar   <- target_total - target_mnar
+
+  if (target_total == 0) {
+    return(list(x_masked = x_mat, mask_idx = integer(0), truth = numeric(0),
+                target_total = 0, target_mnar = 0, target_mar = 0))
+  }
+
+  t_q <- as.numeric(quantile(x_mat[obs_idx], probs = MV.rate, na.rm = TRUE))
+
+  t_mat  <- matrix(rnorm(nr * nc, mean = t_q, sd = thr_sd), nrow = nr, ncol = nc)
+  t_draw <- matrix(rbinom(nr * nc, size = 1, prob = MNAR.ratio), nrow = nr, ncol = nc)
+
+  cand_mnar <- which(!is.na(x_mat) & (x_mat < t_mat) & (t_draw == 1))
+
+  if (length(cand_mnar) >= target_mnar) {
+    mnar_idx <- sample(cand_mnar, target_mnar)
+  } else {
+    mnar_idx <- cand_mnar
+  }
+
+  remaining_obs <- setdiff(obs_idx, mnar_idx)
+
+  if (length(remaining_obs) < target_mar) {
+    mar_idx <- remaining_obs
+  } else {
+    mar_idx <- sample(remaining_obs, target_mar)
+  }
+
+  mask_idx <- c(mnar_idx, mar_idx)
+  truth <- x_mat[mask_idx]
+
+  x_masked <- x_mat
+  x_masked[mask_idx] <- NA
+
+  list(
+    x_masked = x_masked,
+    mask_idx = mask_idx,
+    truth = truth,
+    target_total = length(mask_idx),
+    target_mnar = length(mnar_idx),
+    target_mar = length(mar_idx)
+  )
+}
+```
+# Class A protein: typeMNAR
+```{r}
+define_classA_and_typeMNAR <- function(mat, sample_type,
+                                       det_hi = 0.75,
+                                       miss_hi = 0.75) {
+  stopifnot(length(sample_type) == ncol(mat))
+  types <- unique(sample_type)
+  nr <- nrow(mat)
+
+  det_rate <- sapply(types, function(tt) {
+    cols <- which(sample_type == tt)
+    rowMeans(!is.na(mat[, cols, drop = FALSE]))
+  })
+  rownames(det_rate) <- rownames(mat)
+
+  classA_prots <- character(0)
+  typeMNAR_idx <- integer(0)
+
+  for (p in rownames(mat)) {
+    Td <- types[det_rate[p, ] >= det_hi]
+    Tm <- types[(1 - det_rate[p, ]) >= miss_hi]
+
+    if (length(Td) < 1 || length(Tm) < 1) next
+    if (length(setdiff(Tm, Td)) == 0) next  
+
+    classA_prots <- c(classA_prots, p)
+
+    r <- match(p, rownames(mat))
+    for (tt in Tm) {
+      cols <- which(sample_type == tt)
+      na_cols <- cols[is.na(mat[r, cols, drop = TRUE])]
+      if (length(na_cols) == 0) next
+      idx <- (na_cols - 1) * nr + r
+      typeMNAR_idx <- c(typeMNAR_idx, idx)
+    }
+  }
+
+  list(
+    classA_proteins = unique(classA_prots),
+    typeMNAR_idx = unique(typeMNAR_idx),
+    det_rate = det_rate
+  )
+}
+
+make_per_sample_floor <- function(mat, q = 0.01) {
+  apply(mat, 2, function(v) quantile(v, probs = q, na.rm = TRUE, names = FALSE))
+}
+```
+
+# Cache generation
+```{r}
+dir_create <- function(path) if (!dir.exists(path)) dir.create(path, recursive = TRUE)
+
+prep_cache_one <- function(X_complete,
+                           MV_rate,
+                           beta = 0.5,
+                           rep_id,
+                           seed,
+                           cache_dir,
+                           addMiss_fun,
+                           rf_fun,
+                           minprob_fun,
+                           sample_type,
+                           det_hi = 0.75,
+                           miss_hi = 0.75,
+                           floor_q = 0.01,
+                           overwrite = FALSE) {
+
+  subdir <- file.path(cache_dir,
+                      paste0("MV", MV_rate, "_beta", beta),
+                      sprintf("rep%02d", rep_id))
+  dir_create(subdir)
+
+  f_raw   <- file.path(subdir, "raw.rds")
+  f_rf    <- file.path(subdir, "rf.rds")
+  f_minp  <- file.path(subdir, "minProb.rds")
+  f_mask  <- file.path(subdir, "mask_idx.rds")
+  f_truth <- file.path(subdir, "truth.rds")
+
+  ## NEW files
+  f_type  <- file.path(subdir, "typeMNAR_idx.rds")
+  f_floor <- file.path(subdir, "floor_col.rds")
+
+  if (!overwrite &&
+      file.exists(f_rf) && file.exists(f_minp) &&
+      file.exists(f_mask) && file.exists(f_truth) &&
+      file.exists(f_type) && file.exists(f_floor)) {
+    return(invisible(subdir))
+  }
+
+  # ---- (A) compute typeMNAR on ORIGINAL complete matrix ----
+  cls <- define_classA_and_typeMNAR(X_complete, sample_type, det_hi = det_hi, miss_hi = miss_hi)
+  typeMNAR_idx_full <- cls$typeMNAR_idx
+
+  # per-sample floor on complete matrix (same scale as X_complete)
+  floor_col <- make_per_sample_floor(X_complete, q = floor_q)
+
+  # ---- (B) masking on complete matrix ----
+  masked <- addMiss_fun(X_complete, MV.rate = MV_rate, MNAR.ratio = beta, ini.seed = seed)
+  x_masked <- as.matrix(masked$x_masked)
+  stopifnot(!is.null(dim(x_masked)))
+
+  # ---- (C) convert mask_idx to rc ----
+  rc0 <- arrayInd(masked$mask_idx, .dim = dim(x_masked))
+  truth0 <- masked$truth
+
+  # ---- (D) filter proteins on MASKED matrix (keep missing_rate < 0.9) ----
+  miss_rate <- rowSums(is.na(x_masked)) / ncol(x_masked)
+  keep_rows <- which(miss_rate < 0.9)
+
+  x_filt <- x_masked[keep_rows, , drop = FALSE]
+
+  # ---- (E) remap mask_idx into filtered space ----
+  ok_mask <- rc0[, 1] %in% keep_rows
+  rc_keep <- rc0[ok_mask, , drop = FALSE]
+  truth <- truth0[ok_mask]
+
+  row_map <- match(rc_keep[, 1], keep_rows)
+  col_idx <- rc_keep[, 2]
+  mask_idx <- (col_idx - 1) * nrow(x_filt) + row_map
+
+  # ---- (F) remap typeMNAR_idx into filtered space ----
+  if (length(typeMNAR_idx_full) > 0) {
+    rc_type <- arrayInd(typeMNAR_idx_full, .dim = dim(X_complete))  # (row,col) in full space
+    ok_type <- rc_type[, 1] %in% keep_rows
+    rc_type_keep <- rc_type[ok_type, , drop = FALSE]
+    row_map_type <- match(rc_type_keep[, 1], keep_rows)
+    col_type <- rc_type_keep[, 2]
+    typeMNAR_idx <- (col_type - 1) * nrow(x_filt) + row_map_type
+    typeMNAR_idx <- unique(typeMNAR_idx)
+  } else {
+    typeMNAR_idx <- integer(0)
+  }
+
+  # ---- (G) run imputations on filtered matrix ----
+  df_raw <- as.data.frame(x_filt)
+  df_rf <- rf_fun(df_raw)
+  df_minProb <- minprob_fun(df_raw)
+
+  # ---- (H) save cached objects ----
+  saveRDS(df_raw,     f_raw)
+  saveRDS(df_rf,      f_rf)
+  saveRDS(df_minProb, f_minp)
+  saveRDS(mask_idx,   f_mask)
+  saveRDS(truth,      f_truth)
+
+  saveRDS(typeMNAR_idx, f_type)
+  saveRDS(floor_col,    f_floor)
+
+  invisible(subdir)
+}
+
+prep_cache_all <- function(X_complete,
+                           MV_rates = c(0.2, 0.4, 0.6, 0.8),
+                           beta = 0.5,
+                           repeats = 5,
+                           base_seed = 1001,
+                           cache_dir = "./tuning_cache_50cell",
+                           addMiss_fun,
+                           rf_fun,
+                           minprob_fun,
+                           sample_type,
+                           det_hi = 0.75,
+                           miss_hi = 0.75,
+                           floor_q = 0.01,
+                           overwrite = FALSE) {
+
+  dir_create(cache_dir)
+
+  total_jobs <- length(MV_rates) * repeats
+  job <- 0
+
+  for (mv in MV_rates) {
+    for (r in seq_len(repeats)) {
+      job <- job + 1
+      seed <- base_seed + as.integer(mv*1000) * 100 + r
+
+      subdir <- file.path(cache_dir,
+                          paste0("MV", mv, "_beta", beta),
+                          sprintf("rep%02d", r))
+
+      msg0 <- sprintf("[CACHE %d/%d] MV=%.1f beta=%.2f rep=%02d -> %s",
+                      job, total_jobs, mv, beta, r, subdir)
+      message(msg0)
+      flush.console()
+
+      t0 <- Sys.time()
+      prep_cache_one(
+        X_complete = X_complete,
+        MV_rate = mv,
+        beta = beta,
+        rep_id = r,
+        seed = seed,
+        cache_dir = cache_dir,
+        addMiss_fun = addMiss_fun,
+        rf_fun = rf_fun,
+        minprob_fun = minprob_fun,
+        sample_type = sample_type,
+        det_hi = det_hi,
+        miss_hi = miss_hi,
+        floor_q = floor_q,
+        overwrite = overwrite
+      )
+      dt <- difftime(Sys.time(), t0, units = "secs")
+      message(sprintf("  done in %.1f sec", as.numeric(dt)))
+      flush.console()
+    }
+  }
+
+  invisible(TRUE)
+} 
+```
+
+# Union RMSE scorer (mask truth + typeMNAR floor truth)
+```{r}
+rmse_union_mask_and_typeMNAR <- function(df_imp, mask_idx, truth_mask,
+                                        typeMNAR_idx, floor_col, nrow_mat) {
+  # df_imp: imputed matrix (same dim as cached df_raw)
+  # mask truth is provided as truth_mask (vector aligned to mask_idx)
+  # typeMNAR truth: floor_col per sample
+  # nrow_mat: number of proteins in filtered matrix
+
+  imp_mat <- as.matrix(df_imp)
+  nc <- ncol(imp_mat)
+
+  # union index set
+  U <- union(mask_idx, typeMNAR_idx)
+
+  # predicted
+  pred <- imp_mat[U]
+
+  # truth init as NA
+  truth <- rep(NA_real_, length(U))
+
+  # (A) fill truth for mask_idx from truth_mask
+  pos_mask <- match(mask_idx, U)  # positions in U
+  truth[pos_mask] <- truth_mask
+
+  # (B) fill truth for typeMNAR_idx from per-sample floor
+  if (length(typeMNAR_idx) > 0) {
+    pos_type <- match(typeMNAR_idx, U)
+    rc_type <- arrayInd(typeMNAR_idx, .dim = c(nrow_mat, nc))
+    truth[pos_type] <- floor_col[rc_type[, 2]]
+  }
+
+  ok <- !is.na(truth) & !is.na(pred)
+  sqrt(mean((pred[ok] - truth[ok])^2))
+}
+
+rmse_mask_classA_macro <- function(df_imp,
+                                   mask_idx, truth_mask,
+                                   typeMNAR_idx, floor_col,
+                                   nrow_mat) {
+  imp_mat <- as.matrix(df_imp)
+  nc <- ncol(imp_mat)
+
+  ## ---- (A) Mask RMSE ----
+  rmse_mask <- NA_real_
+  if (length(mask_idx) > 0) {
+    pred_m <- imp_mat[mask_idx]
+    ok_m <- !is.na(pred_m) & !is.na(truth_mask)
+    if (sum(ok_m) > 0) {
+      rmse_mask <- sqrt(mean((pred_m[ok_m] - truth_mask[ok_m])^2))
+    }
+  }
+
+  ## ---- (B) ClassA/typeMNAR RMSE ----
+  rmse_classA <- NA_real_
+  if (length(typeMNAR_idx) > 0) {
+    pred_a <- imp_mat[typeMNAR_idx]
+
+    # map linear indices -> (row,col) so we can pick per-sample floor
+    rc_a <- arrayInd(typeMNAR_idx, .dim = c(nrow_mat, nc))
+    truth_a <- floor_col[rc_a[, 2]]
+
+    ok_a <- !is.na(pred_a) & !is.na(truth_a)
+    if (sum(ok_a) > 0) {
+      rmse_classA <- sqrt(mean((pred_a[ok_a] - truth_a[ok_a])^2))
+    }
+  }
+
+  ## ---- (C) Macro (equal weight across subsets) ----
+  rmse_macro <- mean(c(rmse_mask, rmse_classA), na.rm = TRUE)
+
+  list(
+    rmse_macro  = rmse_macro,
+    rmse_mask   = rmse_mask,
+    rmse_classA = rmse_classA
+  )
+}
+```
+
+# Evaluation
+```{r}
+score_theta <- function(a, b, lambda,
+                        MV_rates = c(0.2, 0.4, 0.6, 0.8),
+                        beta = 0.5,
+                        repeats = 5,
+                        cache_dir = "./tuning_cache_50cell",
+                        visualize = TRUE,
+                        save_dir = "./SoftHybrid_tuning_plots_new_rerun") {
+
+  dir_create(save_dir)
+
+  per_mv <- data.frame(
+    MV_rate = MV_rates,
+    mean_macro  = NA_real_, sd_macro  = NA_real_,
+    mean_mask   = NA_real_, sd_mask   = NA_real_,
+    mean_classA = NA_real_, sd_classA = NA_real_
+  )
+
+  all_rmse_macro  <- c()
+  all_rmse_mask   <- c()
+  all_rmse_classA <- c()
+
+  for (ii in seq_along(MV_rates)) {
+    mv <- MV_rates[ii]
+
+    rmses_macro  <- c()
+    rmses_mask   <- c()
+    rmses_classA <- c()
+
+    for (r in seq_len(repeats)) {
+
+      subdir <- file.path(
+        cache_dir,
+        paste0("MV", mv, "_beta", beta),
+        sprintf("rep%02d", r)
+      )
+
+      df_raw   <- readRDS(file.path(subdir, "raw.rds"))
+      df_rf    <- readRDS(file.path(subdir, "rf.rds"))
+      df_minp  <- readRDS(file.path(subdir, "minProb.rds"))
+      mask_idx <- readRDS(file.path(subdir, "mask_idx.rds"))
+      truth    <- readRDS(file.path(subdir, "truth.rds"))
+
+      ## NEW: ClassA/typeMNAR evaluation
+      typeMNAR_idx <- readRDS(file.path(subdir, "typeMNAR_idx.rds"))
+      floor_col    <- readRDS(file.path(subdir, "floor_col.rds"))
+
+      df_imp <- soft_hybrid_impute(
+        df_rf = df_rf,
+        df_minProb = df_minp,
+        df_raw = df_raw,
+        r0 = NULL, x0 = NULL,
+        a = a, b = b, lambda = lambda,
+        visualize = visualize,
+        group_name = paste0("MV=", mv, "_rep=", r, "_a=", a, "_b=", b, "_lambada=", lambda),
+        save_dir = save_dir
+      )
+
+      rmse_out <- rmse_mask_classA_macro(
+        df_imp       = df_imp,
+        mask_idx     = mask_idx,
+        truth_mask   = truth,
+        typeMNAR_idx = typeMNAR_idx,
+        floor_col    = floor_col,
+        nrow_mat     = nrow(df_raw)
+      )
+
+      rmses_macro  <- c(rmses_macro,  rmse_out$rmse_macro)
+      rmses_mask   <- c(rmses_mask,   rmse_out$rmse_mask)
+      rmses_classA <- c(rmses_classA, rmse_out$rmse_classA)
+    }
+
+    per_mv$mean_macro[ii]  <- mean(rmses_macro,  na.rm = TRUE)
+    per_mv$sd_macro[ii]    <- sd(rmses_macro,    na.rm = TRUE)
+
+    per_mv$mean_mask[ii]   <- mean(rmses_mask,   na.rm = TRUE)
+    per_mv$sd_mask[ii]     <- sd(rmses_mask,     na.rm = TRUE)
+
+    per_mv$mean_classA[ii] <- mean(rmses_classA, na.rm = TRUE)
+    per_mv$sd_classA[ii]   <- sd(rmses_classA,   na.rm = TRUE)
+
+    all_rmse_macro  <- c(all_rmse_macro,  rmses_macro)
+    all_rmse_mask   <- c(all_rmse_mask,   rmses_mask)
+    all_rmse_classA <- c(all_rmse_classA, rmses_classA)
+  }
+
+  overall_mean_macro  <- mean(per_mv$mean_macro,  na.rm = TRUE)
+  overall_sd_macro    <- sd(all_rmse_macro,       na.rm = TRUE)
+
+  overall_mean_mask   <- mean(per_mv$mean_mask,   na.rm = TRUE)
+  overall_sd_mask     <- sd(all_rmse_mask,        na.rm = TRUE)
+
+  overall_mean_classA <- mean(per_mv$mean_classA, na.rm = TRUE)
+  overall_sd_classA   <- sd(all_rmse_classA,      na.rm = TRUE)
+
+  list(
+    a = a, b = b, lambda = lambda,
+    overall_mean_macro  = overall_mean_macro,
+    overall_sd_macro    = overall_sd_macro,
+    overall_mean_mask   = overall_mean_mask,
+    overall_sd_mask     = overall_sd_mask,
+    overall_mean_classA = overall_mean_classA,
+    overall_sd_classA   = overall_sd_classA,
+    per_mv = per_mv
+  )
+}
+```
+
+# Grid Searcher Helpers
+```{r}
+coarse_grid <- expand.grid(
+  a = c(0, 2, 4, 6, 8, 10),
+  b = c(0, 2, 4, 6, 8, 10),
+  lambda = c(0.2, 0.4, 0.6, 0.8)
+)
+
+run_grid <- function(grid_df, ...) {
+  res_list <- vector("list", nrow(grid_df))
+  out_tbl <- data.frame()
+
+  for (i in seq_len(nrow(grid_df))) {
+    z <- score_theta(
+      a = grid_df$a[i],
+      b = grid_df$b[i],
+      lambda = grid_df$lambda[i],
+      ...
+    )
+    res_list[[i]] <- z
+
+    out_tbl <- rbind(out_tbl, data.frame(
+      a = z$a, b = z$b, lambda = z$lambda,
+      overall_mean_macro  = z$overall_mean_macro,
+      overall_sd_macro    = z$overall_sd_macro,
+      overall_mean_mask   = z$overall_mean_mask,
+      overall_mean_classA = z$overall_mean_classA
+    ))
+
+    mv_line <- paste0(
+      sprintf("MV%.1f M=%.3f (mask=%.3f, A=%.3f)",
+              z$per_mv$MV_rate, z$per_mv$mean_macro, z$per_mv$mean_mask, z$per_mv$mean_classA),
+      collapse = " | "
+    )
+
+    message(sprintf(
+      "Done %d/%d | a=%g b=%g lam=%.2f | overall(M)=%.4f | mask=%.4f | A=%.4f | %s",
+      i, nrow(grid_df), z$a, z$b, z$lambda,
+      z$overall_mean_macro, z$overall_mean_mask, z$overall_mean_classA,
+      mv_line
+    ))
+  }
+
+  out_tbl <- out_tbl[order(out_tbl$overall_mean_macro), ]
+  list(summary = out_tbl, details = res_list)
+}
+```
+
+# Run
+```{r , warning =FALSE}
+prep_cache_all(
+  X_complete = mat,
+  MV_rates   = c(0.2, 0.4, 0.6, 0.8),
+  beta       = 0.5,
+  repeats    = 5,
+  cache_dir  = "./tuning_cache_50cell_typeMNAR",
+  addMiss_fun = addMiss_for_tuning,
+  rf_fun = rf_fun,
+  minprob_fun = minprob_fun,
+  sample_type = sample_type,
+  det_hi = 1,
+  miss_hi = 1,
+  floor_q = 0.01,
+  overwrite = FALSE
+)
+
+coarse_res <- run_grid(
+  coarse_grid,
+  MV_rates = c(0.2, 0.4, 0.6, 0.8),
+  beta = 0.5,
+  repeats = 5,
+  cache_dir = "./tuning_cache_50cell_typeMNAR",
+  visualize = false
+)
+
+## best results
+print(head(coarse_res$summary, 20))
+```
+
+```{r}
+param_list <- list(
+  c(2, 2, 0.2),
+  c(2, 8, 0.2),
+  c(8, 2, 0.2),
+  c(2, 2, 0.8)
+)
+
+plot_res_list <- list()
+
+for (i in seq_along(param_list)) {
+  pars <- param_list[[i]]
+  a_i <- pars[1]
+  b_i <- pars[2]
+  lam_i <- pars[3]
+  
+  save_dir_i <- file.path(
+    "./SoftHybrid_tuning_selectedplots",
+    paste0("a", a_i, "_b", b_i, "_lam", lam_i)
+  )
+  
+  message("Running: a=", a_i, ", b=", b_i, ", lambda=", lam_i)
+  
+  plot_res_list[[i]] <- score_theta(
+    a = a_i,
+    b = b_i,
+    lambda = lam_i,
+    MV_rates = 0.4,
+    beta = 0.5,
+    repeats = 5,
+    cache_dir = "./tuning_cache_50cell_typeMNAR",
+    visualize = TRUE,
+    save_dir = save_dir_i
+  )
+}
+
+names(plot_res_list) <- c(
+  "a2_b2_lam0.2",
+  "a2_b8_lam0.2",
+  "a8_b2_lam0.2",
+  "a2_b2_lam0.8"
+)
+```
+
+## Tuning Visualisation
+```{r}
+df_plot <- bind_rows(lapply(coarse_res$details, function(z) {
+  mutate(z$per_mv, a = z$a, b = z$b, lambda = z$lambda)
+})) %>%
+  mutate(
+    a = factor(a),
+    b = factor(b),
+    lambda = factor(lambda),
+    MV_rate = factor(MV_rate)
+  )
+
+p_macro <- ggplot(df_plot, aes(x = a, y = b, fill = mean_macro)) +
+  geom_tile(color = "white") +
+  facet_grid(MV_rate ~ lambda, labeller = label_both) +
+  scale_fill_viridis_c(name = "RMSE (macro)") +
+  labs(
+    title = "SoftHybrid Hyperparameter Optimisation",
+    x = "Parameter a",
+    y = "Parameter b"
+  ) +
+  theme_bw() +
+  theme(
+    panel.border = element_rect(colour = "black", fill = NA),
+    strip.text = element_text(face = "bold"),
+    axis.text = element_text(color = "black", face = "bold"),
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+
+p_macro
+
+p_mask <- ggplot(df_plot, aes(x = a, y = b, fill = mean_mask)) +
+  geom_tile(color = "white") +
+  facet_grid(MV_rate ~ lambda, labeller = label_both) +
+  scale_fill_viridis_c(name = "RMSE (mask)") +
+  labs(
+    title = "SoftHybrid Tuning: Mask RMSE",
+    x = "Parameter a",
+    y = "Parameter b"
+  ) +
+  theme_bw() +
+  theme(
+    panel.border = element_rect(colour = "black", fill = NA),
+    strip.text = element_text(face = "bold"),
+    axis.text = element_text(color = "black", face = "bold"),
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+
+p_classA <- ggplot(df_plot, aes(x = a, y = b, fill = mean_classA)) +
+  geom_tile(color = "white") +
+  facet_grid(MV_rate ~ lambda, labeller = label_both) +
+  scale_fill_viridis_c(name = "RMSE (ClassA)") +
+  labs(
+    title = "SoftHybrid Tuning: ClassA RMSE",
+    x = "Parameter a",
+    y = "Parameter b"
+  ) +
+  theme_bw() +
+  theme(
+    panel.border = element_rect(colour = "black", fill = NA),
+    strip.text = element_text(face = "bold"),
+    axis.text = element_text(color = "black", face = "bold"),
+    plot.title = element_text(hjust = 0.5, face = "bold")
+  )
+
+p_mask
+p_classA
+```
+```{r}
+df_mv_lambda <- bind_rows(lapply(coarse_res$details, function(z) {
+  z$per_mv %>%
+    mutate(
+      a = z$a,
+      b = z$b,
+      lambda = z$lambda
+    )
+})) %>%
+  mutate(
+    MV_rate = as.numeric(as.character(MV_rate)),
+    lambda  = as.numeric(as.character(lambda))
+  )
+
+df_lambda_by_mv <- df_mv_lambda %>%
+  group_by(MV_rate, lambda) %>%
+  summarise(
+    best_RMSE = min(mean_macro, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(MV_rate, lambda)
+
+p_lambda_by_mv <- ggplot(
+  df_lambda_by_mv,
+  aes(x = lambda, y = best_RMSE, group = factor(MV_rate), color = factor(MV_rate))
+) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  labs(
+    title = "Lambda tuning curves across MV rates",
+    x = "Lambda",
+    y = "Best RMSE",
+    color = "MV rate"
+  ) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.text = element_text(face = "bold")
+  )
+
+p_lambda_by_mv
+
+df_lambda_mean <- df_lambda_by_mv %>%
+  group_by(lambda) %>%
+  summarise(
+    mean_RMSE = mean(best_RMSE, na.rm = TRUE),
+    sd_RMSE   = sd(best_RMSE, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(lambda)
+
+p_lambda_mean <- ggplot(df_lambda_mean, aes(x = lambda, y = mean_RMSE, group = 1)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  labs(
+    title = "Mean RMSE vs Lambda across MV rates",
+    x = "Lambda",
+    y = "Mean best RMSE"
+  ) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.text = element_text(face = "bold")
+  )
+
+p_lambda_mean
+
+p_lambda_by_mv | p_lambda_mean
+```
+```{r}
+df_ab_mv <- df_mv_lambda %>%
+  filter(lambda == 0.6)
+
+df_ab_mv_heat <- df_ab_mv %>%
+  dplyr::select(a, b, MV_rate, RMSE = mean_macro) %>%
+  mutate(MV_rate = as.character(MV_rate))
+
+df_ab_mean <- df_ab_mv_heat %>%
+  group_by(a, b) %>%
+  summarise(
+    RMSE = mean(RMSE, na.rm = TRUE),
+    MV_rate = "Mean",
+    .groups = "drop"
+  )
+
+df_ab_plot <- bind_rows(df_ab_mv_heat, df_ab_mean) %>%
+  mutate(
+    MV_rate = factor(MV_rate, levels = c("0.2", "0.4", "0.6", "0.8", "Mean"))
+  )
+
+p_ab_mv <- ggplot(df_ab_plot, aes(x = a, y = b, fill = RMSE)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  facet_wrap(~ MV_rate, nrow = 1) +
+  scale_fill_viridis_c(name = "RMSE") +
+  labs(
+    title = "SoftHybrid parameter surface (lambda = 0.6)",
+    subtitle = "a-b heatmap across MV rates and mean",
+    x = "Parameter a",
+    y = "Parameter b"
+  ) +
+  theme_bw() +
+  theme(
+    strip.text = element_text(face = "bold"),
+    plot.title = element_text(face = "bold", hjust = 0.5)
+  )
+
+p_ab_mv
+
+best_ab <- df_ab_plot %>%
+  group_by(MV_rate) %>%
+  slice_min(RMSE, n = 1)
+
+p_ab_mv +
+  geom_point(
+    data = best_ab,
+    aes(x = a, y = b),
+    inherit.aes = FALSE,
+    shape = 21,
+    size = 4,
+    stroke = 1.2
+  )
+```
+
+
+
+
+
+
+
+

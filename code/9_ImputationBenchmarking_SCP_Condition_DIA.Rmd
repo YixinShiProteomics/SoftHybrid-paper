@@ -7,7 +7,7 @@ output: html_document
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
-pacman::p_load(magrittr, ggplot2, ggVennDiagram, pheatmap, ggridges, umap, limma, dplyr, tidyr, viridis, gridExtra, stringr, ggsci, clusterProfiler, org.Mm.eg.db, UpSetR, missForest,ComplexHeatmap, WGCNA, org.Hs.eg.db, GOSemSim, ggrepel, VennDiagram, GSVA, tibble, purrr, scales, imputeLCMD)
+pacman::p_load(magrittr, ggplot2, ggVennDiagram, pheatmap, ggridges, umap, limma, dplyr, tidyr, viridis, gridExtra, stringr, ggsci, clusterProfiler, org.Mm.eg.db, UpSetR, missForest,ComplexHeatmap, WGCNA, org.Hs.eg.db, GOSemSim, ggrepel, VennDiagram, GSVA, tibble, purrr, scales, imputeLCMD, patchwork)
 ```
 
 # Data Preperation
@@ -16,12 +16,13 @@ pacman::p_load(magrittr, ggplot2, ggVennDiagram, pheatmap, ggridges, umap, limma
 rm(list = ls())
 getwd()
 
-intensity <- read.csv("./data/report.unique_genes_matrix_con.tsv", sep = "\t", header = T)
+intensity <- read.csv("./data/report.unique_genes_matrix_con_rerun.tsv", sep = "\t", header = T)
 
 rownames(intensity) <- intensity$Genes
 intensity <- intensity[,-c(1,2,3)]
-sample <- unlist(lapply(strsplit(colnames(intensity), split = '_', fixed = TRUE), function(x) x[5]))
-group <- unlist(lapply(strsplit(colnames(intensity), split = '.', fixed = TRUE), function(x) x[8]))
+sample <- unlist(lapply(strsplit(colnames(intensity), split = '_', fixed = TRUE), function(x) x[12]))
+sample <- unlist(lapply(strsplit(sample, split = '.', fixed = TRUE), function(x) x[1]))
+group <- unlist(lapply(strsplit(colnames(intensity), split = '.', fixed = TRUE), function(x) x[7]))
 group <- unlist(lapply(strsplit(group, split = '_', fixed = TRUE), function(x) paste0(x[1], '_', x[2])))
 
 metadata <- data.frame(
@@ -35,10 +36,6 @@ colnames(intensity) <- metadata$Sample
 
 intensity <- cbind(intensity[,81:100], intensity[,c(61:80, 101:120)], intensity[, 21:40], intensity[,c(1:20,41:60)])
 metadata <- metadata[colnames(intensity),]
-
-filter_protein <- rownames(intensity)[!grepl("KRT", rownames(intensity))]
-filter_protein <- filter_protein[!filter_protein %in% c("CSTA", "CDSN", "CASP14", "HRNR", "CST6", "KPRP", "FLG2", "EVPL", "IVL", "PKP1")]
-intensity <- intensity[filter_protein,]
 ```
 
 ## Prepare Metadata File
@@ -49,7 +46,6 @@ metadata$Condition <- factor(metadata$Condition, levels = c('Normoxia', 'Hypoxia
 metadata$Type <- factor(metadata$Type, levels = c('GSC', 'AST', 'MAC'))
 metadata$ID <- apply(intensity, 2, function(x) sum(!is.na(x)))
 ```
-
 
 ## Data matrix manipulation
 ```{r}
@@ -64,7 +60,6 @@ df_long$group <- plyr::mapvalues(df_long$sample,
 df_long$group <- factor(df_long$group, levels = c('Hypoxia_GSC', 'Hypoxia_AST', 'Hypoxia_MAC', 'Normoxia_GSC', 'Normoxia_AST', 'Normoxia_MAC'))
 df_long$sample <- factor(df_long$sample, levels = metadata$Sample)
 ```
-
 
 ## Filter expression profile in merged dataset
 ```{r}
@@ -93,7 +88,6 @@ for (i in unique(condition$gene)) {
     }
 }
 df_long_filter <- df_long_log2 %>%
-#  filter(gene %in% common_protein) %>%
   filter(gene %in% geneName1) %>%
   filter(sample %in% filter_sample)
 
@@ -138,34 +132,70 @@ rownames(df_norm) <- df_norm$gene
 df_norm <- df_norm[,-1]
 ```
 
-
 # Imputation
 ## Imputation Method I: RF
 ```{r}
 #set.seed(123)
-#res_all  <- missForest(as.data.frame(df_filter), verbose=FALSE)
-##imp_all  <- res_all$ximp
+#res_all  <- missForest(as.data.frame(df_norm), verbose=FALSE)
+#imp_all  <- res_all$ximp
 #save(imp_all, file = './data_condition/imp_all_benchmarking.Rdata')
 load(file = './data_condition/imp_all_benchmarking.Rdata')
 ```
 
-# Imputation Method II: Minimal Probability of ALL proteins
+## Imputation Method II: Minimal Probability of ALL proteins
 ```{r}
 #set.seed(25)
 #minProb_all <- impute.MinProb(
-#  df_filter,
+#  df_norm,
 #  q = 0.01,
-#  tune.sigma = 0.7
+#  tune.sigma = 1
 #)
 #save(minProb_all, file = './data_condition/minProb_all_benchmarking.Rdata')
 load(file = './data_condition/minProb_all_benchmarking.Rdata')
 ```
 
-# Imputation Method III: combination of RF and minProb
-## Assessment of missing rate
+## Imputation Method III: KNN of ALL proteins
+```{r}
+#set.seed(25)
+#knn_impute <- impute.knn(as.matrix(df_norm), k = 5)
+#knn_all <- as.data.frame(knn_impute[[1]])
+#save(knn_all, file = './data_condition/knn_all_benchmarking.Rdata')
+load(file = './data_condition/knn_all_benchmarking.Rdata')
+```
+
+## Imputation Method IV: gaussian sampling impute of ALL proteins
+```{r}
+#set.seed(25)
+
+#gaussian_impute <- function(df, width = 0.3, downshift = 1.8) {
+#  imputed_df <- df
+#  all_values <- unlist(df)
+#  observed_values <- all_values[!is.na(all_values)]
+#  mu <- mean(observed_values, na.rm = TRUE)
+#  sigma <- sd(observed_values, na.rm = TRUE)
+#  impute_mean <- mu - downshift * sigma
+#  impute_sd <- sigma * width
+#  for (i in 1:nrow(df)) {
+#    for (j in 1:ncol(df)) {
+#      if (is.na(df[i, j])) {
+#        imputed_df[i, j] <- rnorm(1, mean = impute_mean, sd = impute_sd)
+#      }
+#    }
+#  }
+#  return(imputed_df)
+#}
+
+#GS_all <- gaussian_impute(df_norm)
+
+#save(GS_all, file = './data_condition/GS_all_benchmarking.Rdata')
+load(file = './data_condition/GS_all_benchmarking.Rdata')
+```
+
+## Imputation Method V: Soft Hybrid Imputation
+### Assessment of missing rate
 ```{r}
 miss_cor <- data.frame(
-  missing_rate    = rowSums(is.na(df_filter)) / ncol(df_filter),
+  missing_rate    = rowSums(is.na(df_norm)) / ncol(df_norm),
   mean_abundance  = rowMeans(df_filter, na.rm = TRUE)
 )
 ggplot(miss_cor, aes(x = missing_rate, y = mean_abundance)) +
@@ -176,8 +206,6 @@ ggplot(miss_cor, aes(x = missing_rate, y = mean_abundance)) +
   xlab("Missing Rate") +
   ylab("Mean log2 Abundance") +
   ggtitle("Correlation of Abundance and Missing Rate")
-
-#Elbow point: 1 missing sample
 ```
 
 ```{r}
@@ -219,77 +247,9 @@ ggplot(miss_cor, aes(x = missing_rate, y = mean_abundance)) +
   ylab("Mean log2 Abundance") +
   ggtitle("Loess-Based Elbow Point by Maximum Distance Method")
 ```
-
-## Imputation Method III:  Soft combination of RF and minProb at Elbow point
-```{r, warning=FALSE}
-#missing_rate <- rowSums(is.na(df_filter)) / ncol(df_filter)
-#thr <- 0.18
-#genes_low  <- names(missing_rate)[missing_rate <= thr]
-#genes_high <- names(missing_rate)[missing_rate >  thr]
-#df_low  <- df_filter[genes_low, , drop=FALSE]
-#df_high <- df_filter[genes_high, , drop=FALSE]
-
-#set.seed(123)
-#res_low  <- missForest(as.data.frame(df_low), verbose=FALSE)
-#imp_low  <- res_low$ximp
-#save(imp_low, file = './data_condition/imp_low_benchmarking.Rdata')
-#load(file = './data_condition/imp_low_benchmarking.Rdata')
-
-#set.seed(25)
-#imp_high <- impute.MinProb(
-#  df_high,
-#  q = 0.01,
-#  tune.sigma = 0.7
-#)
-#imp_combo <- rbind(imp_low, imp_high)
-#save(imp_combo, file = './data_condition/imp_combo_benchmarking.Rdata')
-load(file = './data_condition/imp_combo_benchmarking.Rdata')
-```
-
-# Imputation Method IV: KNN of ALL proteins
-```{r}
-#set.seed(25)
-#knn_impute <- impute.knn(as.matrix(df_filter), k = 5)
-#knn_all <- as.data.frame(knn_impute[[1]])
-#save(knn_all, file = './data_condition/knn_all_benchmarking.Rdata')
-load(file = './data_condition/knn_all_benchmarking.Rdata')
-```
-
-# Imputation Method V: gaussian sampling impute of ALL proteins
-```{r}
-#set.seed(25)
-
-#gaussian_impute <- function(df, width = 0.3, downshift = 1.8) {
-#  imputed_df <- df
-#  all_values <- unlist(df)
-#  observed_values <- all_values[!is.na(all_values)]
-#  
-#  mu <- mean(observed_values, na.rm = TRUE)
-#  sigma <- sd(observed_values, na.rm = TRUE)
-#  
-#  impute_mean <- mu - downshift * sigma
-#  impute_sd <- sigma * width
-  
-#  for (i in 1:nrow(df)) {
-#    for (j in 1:ncol(df)) {
-#      if (is.na(df[i, j])) {
-#        imputed_df[i, j] <- rnorm(1, mean = impute_mean, sd = impute_sd)
-#      }
-#    }
-#  }
-#  return(imputed_df)
-#}
-
-#GS_all <- gaussian_impute(df_filter)
-
-#save(GS_all, file = './data_condition/GS_all_benchmarking.Rdata')
-load(file = './data_condition/GS_all_benchmarking.Rdata')
-```
-
-# Imputation Method VI: Soft Hybrid Imputation
 ```{r}
 soft_hybrid_impute <- function(df_rf, df_minProb, df_raw, 
-                               r0 = NULL, x0 = NULL, a = 10, b = 5, lambda = 0.5,
+                               r0 = NULL, x0 = NULL, a = 10, b = 5, lambda = 0.4,
                                visualize = TRUE) {
   stopifnot(all(dim(df_rf) == dim(df_minProb)))
   stopifnot(all(rownames(df_rf) == rownames(df_minProb)))
@@ -364,15 +324,10 @@ soft_hybrid_impute <- function(df_rf, df_minProb, df_raw,
 ```
 
 ```{r}
-#df_imp_soft <- soft_hybrid_impute(imp_all, minProb_all, df_filter, lambda = 0.5)
-#save(df_imp_soft, file = './data_condition/SoftHybridImputation_benchmarking.Rdata')
+df_imp_soft <- soft_hybrid_impute(imp_all, minProb_all, df_filter, lambda = 0.4)
+save(df_imp_soft, file = './data_condition/SoftHybridImputation_benchmarking.Rdata')
 load(file = './data_condition/SoftHybridImputation_benchmarking.Rdata')
 ```
-
-```{r}
-#imp <- soft_hybrid_impute(imp_all, minProb_all, df_filter, visualize = TRUE)
-```
-
 
 # Limma Comaprison
 ## Run in the same batch
@@ -434,79 +389,12 @@ results_list <- list(
 ```
 
 ```{r}
-run_enrichment <- function(up_df, orgdb = org.Hs.eg.db, show_n = 10) {
-  hypoxia_uplist <- up_df$gene
-  gene_df <- bitr(hypoxia_uplist, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = orgdb)
-  entrez_ids <- gene_df$ENTREZID
-
-  if (length(entrez_ids) < 5) {
-    warning("Too few ENTREZ IDs for enrichment.")
-    return(list(KEGG = NULL, Reactome = NULL, GO = NULL))
-  }
-
-  # KEGG
-  kegg_res <- tryCatch(
-    enrichKEGG(gene = entrez_ids, organism = 'hsa'),
-    error = function(e) NULL
-  )
-  
-  # Reactome
-  reactome_res <- tryCatch(
-    enrichPathway(gene = entrez_ids, organism = 'human'),
-    error = function(e) NULL
-  )
-
-  # GO
-  go_res <- tryCatch(
-    enrichGO(gene = entrez_ids, OrgDb = orgdb, keyType = "ENTREZID", ont = "BP",
-             pAdjustMethod = "BH", pvalueCutoff = 0.05),
-    error = function(e) NULL
-  )
-
-  return(list(
-    KEGG = kegg_res,
-    Reactome = reactome_res,
-    GO = go_res
-  ))
-}
-```
-
-```{r, warning=FALSE}
-enrichment_results <- lapply(results_list, function(res) {
-  run_enrichment(res$upregulated)
-})
-
-```
-
-```{r}
-#dotplot(enrichment_results$RF$GO, showCategory = 10, title = "RF - GO Enrichment")
-dotplot(enrichment_results$minProb$GO, showCategory = 10, title = "minProb - GO Enrichment")
-#dotplot(enrichment_results$SoftHybrid$GO, showCategory = 10, title = "SoftHybrid - GO Enrichment")
-#dotplot(enrichment_results$KNN$GO, showCategory = 10, title = "KNN - GO Enrichment")
-dotplot(enrichment_results$Gaussian$GO, showCategory = 10, title = "Gaussian - GO Enrichment")
-
-```
-
-
-```{r}
-#dotplot(enrichment_results$RF$KEGG, showCategory = 10, title = "RF - KEGG Enrichment")
-#dotplot(enrichment_results$minProb$KEGG, showCategory = 10, title = "minProb - KEGG Enrichment")
-#dotplot(enrichment_results$SoftHybrid$KEGG, showCategory = 10, title = "SoftHybrid - KEGG Enrichment")
-dotplot(enrichment_results$KNN$KEGG, showCategory = 10, title = "KNN - KEGG Enrichment")
-dotplot(enrichment_results$Gaussian$KEGG, showCategory = 10, title = "Gaussian - KEGG Enrichment")
-```
-
-```{r}
 hallmarks <- read.gmt('./resource/h.all.v2023.2.Hs.symbols.gmt')
 
 run_gsea_hallmark <- function(limma_df, method_name = "") {
   gene_df <- limma_df %>%
     dplyr::select(gene, logFC) %>%
     filter(!is.na(gene), !is.na(logFC))
-  gene_map <- bitr(gene_df$gene, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
-  gene_df <- merge(gene_df, gene_map, by.x = "gene", by.y = "SYMBOL") %>%
-    distinct(ENTREZID, .keep_all = TRUE)
-
   geneList <- gene_df$logFC
   names(geneList) <- gene_df$gene
   geneList <- sort(geneList, decreasing = TRUE)
@@ -522,8 +410,6 @@ run_gsea_hallmark <- function(limma_df, method_name = "") {
 
   return(gsea_res)
 }
-
-
 ```
 
 ```{r, warning=FALSE}
@@ -541,7 +427,7 @@ pRF <- dotplot(gsea_results$RF,
         split = ".sign") +
   facet_grid(~.sign) +
   ggtitle("GSEA - RF") +
-  coord_cartesian(xlim = c(0, 0.55), clip = "off") +
+  coord_cartesian(xlim = c(0, 0.65), clip = "off") +
   scale_color_gradient2(
     high = "#4575b4", mid = "white", low = "#d73027", midpoint = 0.1,
     name = "p.adjust",
@@ -560,7 +446,7 @@ pRF <- dotplot(gsea_results$RF,
     text             = element_text(size = 13),
     axis.text        = element_text(size = 13, face = "bold"),
     axis.text.x      = element_text(color = "black", size = 13, face = "bold"),
-    axis.text.y      = element_text(color = "black", size = 13, face = "bold"), # y轴文字
+    axis.text.y      = element_text(color = "black", size = 13, face = "bold"), 
     axis.ticks.length= unit(2, "mm"),
     axis.title       = element_text(size = 14, face = "bold"),
     panel.grid.major = element_blank(),
@@ -568,8 +454,8 @@ pRF <- dotplot(gsea_results$RF,
     legend.position  = "right",
     legend.title     = element_text(size = 13, face = "bold"),
     legend.text      = element_text(size = 12),
-    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15), # 标题居中、加粗
-    strip.text       = element_text(size = 13, face = "bold") # facet名称
+    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15), 
+    strip.text       = element_text(size = 13, face = "bold") 
   )
 pRF
 
@@ -579,7 +465,7 @@ pMP <- dotplot(gsea_results$minProb,
         split = ".sign") +
   facet_grid(~.sign) +
   ggtitle("GSEA - minProb") +
-  coord_cartesian(xlim = c(0, 0.55), clip = "off") +
+  coord_cartesian(xlim = c(0, 0.65), clip = "off") +
   scale_color_gradient2(
     high = "#4575b4", mid = "white", low = "#d73027", midpoint = 0.1,
     name = "p.adjust",
@@ -598,7 +484,7 @@ pMP <- dotplot(gsea_results$minProb,
     text             = element_text(size = 13),
     axis.text        = element_text(size = 13, face = "bold"),
     axis.text.x      = element_text(color = "black", size = 13, face = "bold"),
-    axis.text.y      = element_text(color = "black", size = 13, face = "bold"), # y轴文字
+    axis.text.y      = element_text(color = "black", size = 13, face = "bold"), 
     axis.ticks.length= unit(2, "mm"),
     axis.title       = element_text(size = 14, face = "bold"),
     panel.grid.major = element_blank(),
@@ -606,8 +492,8 @@ pMP <- dotplot(gsea_results$minProb,
     legend.position  = "right",
     legend.title     = element_text(size = 13, face = "bold"),
     legend.text      = element_text(size = 12),
-    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15), # 标题居中、加粗
-    strip.text       = element_text(size = 13, face = "bold") # facet名称
+    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15), 
+    strip.text       = element_text(size = 13, face = "bold") 
   )
 pMP
 
@@ -617,7 +503,7 @@ pSH <- dotplot(gsea_results$SoftHybrid,
         split = ".sign") +
   facet_grid(~.sign) +
   ggtitle("GSEA - SoftHybrid") +
-  coord_cartesian(xlim = c(0, 0.55), clip = "off") +
+  coord_cartesian(xlim = c(0, 0.65), clip = "off") +
   scale_color_gradient2(
     high = "#4575b4", mid = "white", low = "#d73027", midpoint = 0.1,
     name = "p.adjust",
@@ -636,7 +522,7 @@ pSH <- dotplot(gsea_results$SoftHybrid,
     text             = element_text(size = 13),
     axis.text        = element_text(size = 13, face = "bold"),
     axis.text.x      = element_text(color = "black", size = 13, face = "bold"),
-    axis.text.y      = element_text(color = "black", size = 13, face = "bold"), # y轴文字
+    axis.text.y      = element_text(color = "black", size = 13, face = "bold"), 
     axis.ticks.length= unit(2, "mm"),
     axis.title       = element_text(size = 14, face = "bold"),
     panel.grid.major = element_blank(),
@@ -644,8 +530,8 @@ pSH <- dotplot(gsea_results$SoftHybrid,
     legend.position  = "right",
     legend.title     = element_text(size = 13, face = "bold"),
     legend.text      = element_text(size = 12),
-    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15), # 标题居中、加粗
-    strip.text       = element_text(size = 13, face = "bold") # facet名称
+    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15), 
+    strip.text       = element_text(size = 13, face = "bold") 
   )
 pSH
 
@@ -655,7 +541,7 @@ pKNN <- dotplot(gsea_results$KNN,
         split = ".sign") +
   facet_grid(~.sign) +
   ggtitle("GSEA - KNN") +
-  coord_cartesian(xlim = c(0, 0.55), clip = "off") +
+  coord_cartesian(xlim = c(0, 0.65), clip = "off") +
   scale_color_gradient2(
     high = "#4575b4", mid = "white", low = "#d73027", midpoint = 0.1,
     name = "p.adjust",
@@ -674,7 +560,7 @@ pKNN <- dotplot(gsea_results$KNN,
     text             = element_text(size = 13),
     axis.text        = element_text(size = 13, face = "bold"),
     axis.text.x      = element_text(color = "black", size = 13, face = "bold"),
-    axis.text.y      = element_text(color = "black", size = 13, face = "bold"), # y轴文字
+    axis.text.y      = element_text(color = "black", size = 13, face = "bold"), 
     axis.ticks.length= unit(2, "mm"),
     axis.title       = element_text(size = 14, face = "bold"),
     panel.grid.major = element_blank(),
@@ -682,8 +568,8 @@ pKNN <- dotplot(gsea_results$KNN,
     legend.position  = "right",
     legend.title     = element_text(size = 13, face = "bold"),
     legend.text      = element_text(size = 12),
-    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15), # 标题居中、加粗
-    strip.text       = element_text(size = 13, face = "bold") # facet名称
+    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15), 
+    strip.text       = element_text(size = 13, face = "bold") 
   )
 pKNN
 
@@ -693,7 +579,7 @@ pG <- dotplot(gsea_results$Gaussian,
         split = ".sign") +
   facet_grid(~.sign) +
   ggtitle("GSEA - Gaussian") +
-  coord_cartesian(xlim = c(0, 0.55), clip = "off") +
+  coord_cartesian(xlim = c(0, 0.65), clip = "off") +
   scale_color_gradient2(
     high = "#4575b4", mid = "white", low = "#d73027", midpoint = 0.1,
     name = "p.adjust",
@@ -712,7 +598,7 @@ pG <- dotplot(gsea_results$Gaussian,
     text             = element_text(size = 13),
     axis.text        = element_text(size = 13, face = "bold"),
     axis.text.x      = element_text(color = "black", size = 13, face = "bold"),
-    axis.text.y      = element_text(color = "black", size = 13, face = "bold"), # y轴文字
+    axis.text.y      = element_text(color = "black", size = 13, face = "bold"), 
     axis.ticks.length= unit(2, "mm"),
     axis.title       = element_text(size = 14, face = "bold"),
     panel.grid.major = element_blank(),
@@ -720,8 +606,8 @@ pG <- dotplot(gsea_results$Gaussian,
     legend.position  = "right",
     legend.title     = element_text(size = 13, face = "bold"),
     legend.text      = element_text(size = 12),
-    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15), # 标题居中、加粗
-    strip.text       = element_text(size = 13, face = "bold") # facet名称
+    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15), 
+    strip.text       = element_text(size = 13, face = "bold") 
   )
 pG
 ```
@@ -740,8 +626,8 @@ ggsave(
   plot = pDot_Combo,                      
   device = "tiff",                    
   dpi = 300,                         
-  width = 15,                         
-  height = 8,                        
+  width = 18,                         
+  height = 9,                        
   units = "in"                       
 )
 
@@ -750,7 +636,7 @@ ggsave(
   plot = pSH,                      
   device = "tiff",                    
   dpi = 300,                          
-  width = 8,                        
+  width = 9,                        
   height = 4,                       
   units = "in"                       
 )
@@ -780,67 +666,31 @@ rownames(hypoxia_df) <- c('RF', 'minProb', 'SoftHybrid', 'KNN', 'Gaussian')
 
 ```{r}
 hypoxia_df <- hypoxia_df[,-c(1,3)]
-hypoxia_df$GeneRatio <- c(0.43, 0.43, 0.49, 0.37, 0.39)
+
+protein_rf <- unlist(strsplit(gsea_results$RF@result$core_enrichment[1], split = "/"))
+protein_minProb <- unlist(strsplit(gsea_results$minProb@result$core_enrichment[1], split = "/"))
+protein_SoftHybrid <- unlist(strsplit(gsea_results$SoftHybrid@result$core_enrichment[1], split = "/"))
+protein_KNN <- unlist(strsplit(gsea_results$KNN@result$core_enrichment[1], split = "/"))
+protein_Gaussian <- unlist(strsplit(gsea_results$Gaussian@result$core_enrichment[1], split = "/"))
+
+hypoxia_df$GeneRatio <- c(length(protein_rf), length(protein_minProb), length(protein_SoftHybrid), length(protein_KNN), length(protein_Gaussian))/200
 ```
 
-
-```{r}
-hypoxia_long <- hypoxia_df %>%
-  pivot_longer(cols = -Method, 
-               names_to = "Metric", 
-               values_to = "Value")
-
-method_colors <- c(
-  "RF"         = "#009E73",  
-  "minProb"    = "#D55E00",  
-  "Gaussian"   = "#E69F00",  
-  "KNN"        = "#56B4E9",  
-  "SoftHybrid" = "#9966CC" 
-)
-
-pcombo <- ggplot(hypoxia_long, aes(x = Method, y = Value, fill = Method)) +
-  geom_col(width = 0.7, alpha = 0.9) +
-  scale_fill_manual(values = method_colors) +  
-  facet_wrap(~Metric, scales = "free_y") +
-  theme_bw() +
-  labs(
-    title = "GSEA Results for HALLMARK_HYPOXIA",
-    x = "Imputation Method",
-    y = "Value"
-  ) +
-  theme(
-    text = element_text(size = 12),
-    axis.text = element_text(size = 10),
-    axis.text.x = element_blank(),
-    panel.grid.major = element_blank(),
-    panel.grid.minor = element_blank(),
-    plot.title = element_text(hjust = 0.5, face = "bold", size = 14) 
-  )
-
-pcombo
-
-ggsave(
-  filename = "./figure_benchmarking/SCP_Condition_GSEA.tiff",  
-  plot = pcombo,                     
-  device = "tiff",                   
-  dpi = 300,                          
-  width = 8,                         
-  height = 5,                        
-  units = "in"                       
-)
-```
 ```{r}
 hypoxia_df$logFDR <- -log10(hypoxia_df$p.adjust)
+hypoxia_df_all <- hypoxia_df %>%
+  arrange(NES)
+hypoxia_df_all$Method <- factor(hypoxia_df_all$Method, levels = hypoxia_df_all$Method)
 
 pHypoxia_data <- 
-ggplot(hypoxia_df, aes(x = logFDR, y = Method)) +
-  geom_point(aes(size = GeneRatio, color = NES), shape = 16) +
-  scale_color_gradient2(low = "#4575b4", mid = "white", high = "#d73027", midpoint = 1.95) +
+ggplot(hypoxia_df_all, aes(x = NES, y = Method)) +
+  geom_point(aes(size = GeneRatio, color = logFDR), shape = 16) +
+  scale_color_gradient2(low = "#4575b4", mid = "white", high = "#d73027", midpoint = 2.5) +
   scale_size(range = c(3, 8), trans = "sqrt") +
   theme_bw() +
   labs(title = "GSEA Results for HALLMARK_HYPOXIA",
-       x = "-log10(adjusted p-value)", y = "Imputation Method",
-       size = "Gene Ratio", color = "NES") +
+       x = "NES", y = "Imputation Method",
+       size = "Gene Ratio", color = "-log10(adj.p-value)") +
   theme(
     panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
     text             = element_text(size = 13),
@@ -863,11 +713,55 @@ ggsave(
   plot = pHypoxia_data,                      
   device = "tiff",                    
   dpi = 300,                         
-  width = 7,                         
+  width = 10,                         
   height = 4,                       
   units = "in"                       
 )
 ```
+```{r}
+hypoxia_df$logFDR <- -log10(hypoxia_df$p.adjust)
+hypoxia_df_main <- hypoxia_df %>%
+  filter(Method != 'KNN') %>%
+  arrange(NES)
+hypoxia_df_main$Method <- factor(hypoxia_df_main$Method, levels = hypoxia_df_main$Method)
+
+pHypoxia_data <- 
+ggplot(hypoxia_df_main, aes(x = NES, y = Method)) +
+  geom_point(aes(size = GeneRatio, color = logFDR), shape = 16) +
+  scale_color_gradient2(low = "#4575b4", mid = "white", high = "#d73027", midpoint = 2.5) +
+  scale_size(range = c(3, 8), trans = "sqrt") +
+  theme_bw() +
+  labs(title = "GSEA Results for HALLMARK_HYPOXIA",
+       x = "NES", y = "Imputation Method",
+       size = "Gene Ratio", color = "-log10(adj.p-value)") +
+  theme(
+    panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+    text             = element_text(size = 13),
+    axis.text        = element_text(size = 13, face = "bold"),
+    axis.text.x      = element_text(color = "black", size = 13, face = "bold"),
+    axis.text.y      = element_text(color = "black", size = 13, face = "bold"), 
+    axis.ticks.length= unit(2, "mm"),
+    axis.title       = element_text(size = 14, face = "bold"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.position  = "right",
+    legend.title     = element_text(size = 13, face = "bold"),
+    legend.text      = element_text(size = 12),
+    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15), 
+    strip.text       = element_text(size = 13, face = "bold") 
+  )
+pHypoxia_data
+ggsave(
+  filename = "./figure_benchmarking/Hypoxia_Results_main.tiff",  
+  plot = pHypoxia_data,                      
+  device = "tiff",                    
+  dpi = 300,                         
+  width = 8,                         
+  height = 4.5,                       
+  units = "in"                       
+)
+```
+
 
 ```{r}
 gsea_df <- data.frame(
@@ -875,9 +769,10 @@ gsea_df <- data.frame(
   unlist(strsplit(gsea_results$minProb@result$Description, split = '/', fixed = TRUE)),
   unlist(strsplit(gsea_results$KNN@result$Description, split = '/', fixed = TRUE)),
   unlist(strsplit(gsea_results$Gaussian@result$Description, split = '/', fixed = TRUE))),
-  'Method' = c(rep('RF', 8), rep('minProb', 6), rep('KNN', 7), rep('Gaussian', 3)),
+  'Method' = c(rep('RF', 7), rep('minProb', 8), rep('KNN', 7), rep('Gaussian', 8)),
   'pvalue' = c(gsea_results$RF@result$p.adjust, gsea_results$minProb@result$p.adjust, gsea_results$KNN@result$p.adjust, gsea_results$Gaussian@result$p.adjust),
-  'GeneRatio' = c(0.431, 0.405, 0.210, 0.292, 0.464, 0.221, 0.450, 0.262, 0.431, 0.428, 0.459, 0.328, 0.221, 0.210, 0.378, 0.333, 0.373, 0.220, 0.321, 0.50, 0.053, 0.392, 0.429, 0.344),
+  'GeneRatio' = c(pRF$data$GeneRatio, pMP$data$GeneRatio, pKNN$data$GeneRatio, pG$data$GeneRatio),
+  'NES' = c(pRF$data$NES, pMP$data$NES, pKNN$data$NES, pG$data$NES),
   'Status' = 'activated'
 )
 ```
@@ -888,7 +783,7 @@ method_lv <- c("RF","minProb","KNN","Gaussian")
 gsea_df$Method <- factor(gsea_df$Method, levels = intersect(method_lv, unique(gsea_df$Method)))
 gsea_df <- gsea_df %>%
   mutate(logp = -log10(pvalue))
-gsea_df$Status[c(2,5,7,10,11,15,19,20,23)] <- 'suppressed'
+gsea_df$Status[gsea_df$NES < 0] <- "suppressed"
 
 pathway_order <- gsea_df %>%
   group_by(Hallmark) %>%
@@ -928,47 +823,496 @@ p_gsea_bubble <- ggplot(gsea_df, aes(x = Method, y = Hallmark,
 p_gsea_bubble
 ```
 ```{r}
-gsea_df2 <- gsea_df %>%
-  mutate(GR_bin = cut(GeneRatio,
-                      breaks = quantile(GeneRatio, probs = seq(0, 1, 0.25), na.rm = TRUE),
-                      include.lowest = TRUE, labels = c("Q1","Q2","Q3","Q4")))
-
-p_gsea_bubble <- ggplot(gsea_df2, aes(x = Method, y = Hallmark,
-                                      size = GR_bin, color = logp)) +
-  geom_point(alpha = 0.95) +
-  facet_grid(. ~ Status, scales = "free_x", space = "free_x") +
-  scale_size_manual(values = c(2, 4, 6, 10), name = "Gene ratio (quantiles)") +
-  scale_color_viridis_c(direction = 1, name = '-log10(pvalue)') +
-  theme_bw() + 
-  labs(title = "GSEA bubble plot across imputation methods",
-                    x = "Imputation method", y = "Enriched pathways") +
-  theme(
-    panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
-    text             = element_text(size = 13),
-    axis.text        = element_text(size = 13, face = "bold"),
-    axis.text.x      = element_text(color = "black", size = 13, face = "bold"),
-    axis.text.y      = element_text(color = "black", size = 13, face = "bold"), # y轴文字
-    axis.ticks.length= unit(2, "mm"),
-    axis.title       = element_text(size = 14, face = "bold"),
-    panel.grid.major = element_blank(),
-    panel.grid.minor = element_blank(),
-    legend.position  = "right",
-    legend.title     = element_text(size = 13, face = "bold"),
-    legend.text      = element_text(size = 12),
-    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15), # 标题居中、加粗
-    strip.text       = element_text(size = 13, face = "bold") # facet名称
-  )
-p_gsea_bubble
-
 ggsave(
   filename = "./figure_benchmarking/gsea_all_comboinone.tiff",  
   plot = p_gsea_bubble,                    
   device = "tiff",                    
   dpi = 300,                          
-  width = 13,                        
-  height = 5,                     
+  width = 12.5,                        
+  height = 5.5,                     
   units = "in"                        
 )
+```
+
+# Hypxia related protein
+## Missing rate
+```{r}
+hypoxia_genes <- hallmarks %>%
+  filter(term == "HALLMARK_HYPOXIA") %>%
+  pull(gene) %>%
+  unique()
+
+hypoxia_genes_in_data <- intersect(hypoxia_genes, rownames(df_filter))
+
+length(hypoxia_genes_in_data)
+hypoxia_genes_in_data[1:10]
+
+df_hypoxia_raw <- df_filter[hypoxia_genes_in_data, , drop = FALSE]
+
+hypoxia_samples  <- metadata$Sample[metadata$Condition == "Hypoxia"]
+normoxia_samples <- metadata$Sample[metadata$Condition == "Normoxia"]
+
+hypoxia_missing_df <- data.frame(
+  Gene = rownames(df_hypoxia_raw),
+  MissingRate_Overall  = rowMeans(is.na(df_hypoxia_raw)),
+  MissingRate_Hypoxia  = rowMeans(is.na(df_hypoxia_raw[, hypoxia_samples, drop = FALSE])),
+  MissingRate_Normoxia = rowMeans(is.na(df_hypoxia_raw[, normoxia_samples, drop = FALSE])),
+  MeanAbundance_Observed = rowMeans(df_hypoxia_raw, na.rm = TRUE)
+)
+
+hypoxia_missing_df <- hypoxia_missing_df %>%
+  arrange(desc(MissingRate_Overall))
+
+head(hypoxia_missing_df)
+```
+```{r}
+hypoxia_missing_df$Gene <- factor(
+  hypoxia_missing_df$Gene,
+  levels = hypoxia_missing_df$Gene[order(hypoxia_missing_df$MissingRate_Normoxia)]
+)
+
+hypoxia_missing_plot <- hypoxia_missing_df %>%
+  dplyr::select(Gene, MissingRate_Normoxia, MissingRate_Hypoxia) %>%
+  pivot_longer(
+    cols = c(MissingRate_Normoxia, MissingRate_Hypoxia),
+    names_to = "Condition",
+    values_to = "MissingRate"
+  ) %>%
+  mutate(
+    Condition = factor(
+      Condition,
+      levels = c("MissingRate_Normoxia", "MissingRate_Hypoxia"),
+      labels = c("Normoxia", "Hypoxia")
+    ),
+    MissingRate_plot = ifelse(Condition == "Normoxia", -MissingRate, MissingRate)
+  )
+
+p_hypoxia_missing_bar <- ggplot(
+  hypoxia_missing_plot,
+  aes(x = Gene, y = MissingRate_plot, fill = Condition)
+) +
+  geom_col(width = 0.8) +
+  coord_flip() +
+  scale_y_continuous(
+    labels = function(x) scales::percent(abs(x), accuracy = 1),
+    breaks = seq(-1, 1, by = 0.25),
+    limits = c(-1, 1)
+  ) +
+  scale_fill_manual(values = c("Normoxia" = "#0072B2", "Hypoxia" = "#D55E00")) +
+  labs(
+    title = "Missing rate of HALLMARK_HYPOXIA proteins in raw data",
+    x = NULL,
+    y = "Missing rate"
+  ) +
+  theme_bw() +
+  theme(
+    panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+    text             = element_text(size = 13),
+    axis.text        = element_text(size = 11, face = "bold"),
+    axis.text.y      = element_blank(),
+    axis.ticks.y     = element_blank(),
+    axis.title       = element_text(size = 14, face = "bold"),
+    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    legend.title     = element_blank(),
+    legend.position  = "top"
+  ) +
+  geom_vline(xintercept = NULL) +
+  geom_hline(yintercept = 0, linewidth = 0.5, color = "black")
+
+p_hypoxia_missing_bar
+```
+
+## Abundance Plot
+```{r}
+hypoxia_genes_in_data <- unique(c(protein_rf, protein_minProb, protein_SoftHybrid, protein_Gaussian))
+```
+
+```{r}
+prepare_hypoxia_pathway_df <- function(expr_mat, metadata, method_name, gene_set) {
+  
+  expr_sub <- expr_mat[intersect(gene_set, rownames(expr_mat)), , drop = FALSE]
+  
+  df_long <- expr_sub %>%
+    as.data.frame() %>%
+    mutate(Gene = rownames(.)) %>%
+    pivot_longer(
+      cols = -Gene,
+      names_to = "Sample",
+      values_to = "Expression"
+    ) %>%
+    left_join(
+      metadata %>% dplyr::select(Sample, Condition),
+      by = "Sample"
+    ) %>%
+    mutate(Method = method_name)
+  
+  return(df_long)
+}
+
+plot_raw   <- prepare_hypoxia_pathway_df(df_norm,    metadata, "Raw",        hypoxia_genes_in_data)
+plot_rf    <- prepare_hypoxia_pathway_df(imp_all,      metadata, "RF",         hypoxia_genes_in_data)
+plot_mp    <- prepare_hypoxia_pathway_df(minProb_all,  metadata, "minProb",    hypoxia_genes_in_data)
+plot_sh    <- prepare_hypoxia_pathway_df(df_imp_soft,  metadata, "SoftHybrid", hypoxia_genes_in_data)
+plot_knn   <- prepare_hypoxia_pathway_df(knn_all,      metadata, "KNN",        hypoxia_genes_in_data)
+plot_gs    <- prepare_hypoxia_pathway_df(GS_all,       metadata, "Gaussian",   hypoxia_genes_in_data)
+
+hypoxia_plot_df <- bind_rows(
+  plot_raw, plot_rf, plot_mp, plot_sh, plot_knn, plot_gs
+)
+
+hypoxia_plot_df$Condition <- factor(
+  hypoxia_plot_df$Condition,
+  levels = c("Normoxia", "Hypoxia")
+)
+
+hypoxia_plot_df$Method <- factor(
+  hypoxia_plot_df$Method,
+  levels = c("Raw", "RF", "minProb", "SoftHybrid", "KNN", "Gaussian")
+)
+
+hypoxia_mean_df <- hypoxia_plot_df %>%
+  group_by(Method, Gene, Condition) %>%
+  summarise(
+    MeanExpression = mean(Expression, na.rm = TRUE),
+    SD = sd(Expression, na.rm = TRUE),
+    N = sum(!is.na(Expression)),
+    SE = SD / sqrt(N),
+    .groups = "drop"
+  )
+
+head(hypoxia_mean_df)
+```
+
+```{r}
+p_hypoxia_diamond <- ggplot(
+  hypoxia_mean_df,
+  aes(x = Condition, y = MeanExpression, group = Gene)
+) +
+  geom_line(color = "grey60", alpha = 0.7, linewidth = 0.5) +
+  geom_point(
+    aes(fill = Condition),
+    shape = 18,
+    size = 2.6,
+    color = "black",
+    stroke = 0.3
+  ) +
+  facet_wrap(~Method, ncol = 3, scales = "free_y") +
+  scale_fill_manual(values = c("Normoxia" = "#0072B2", "Hypoxia" = "#D55E00")) +
+  labs(
+    title = "HALLMARK_HYPOXIA proteins: Hypoxia vs Normoxia across imputation methods",
+    x = NULL,
+    y = "Mean log2 abundance"
+  ) +
+  theme_bw() +
+  theme(
+    panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+    text             = element_text(size = 13),
+    axis.text        = element_text(size = 12, face = "bold"),
+    axis.title       = element_text(size = 14, face = "bold"),
+    strip.text       = element_text(size = 13, face = "bold"),
+    legend.position  = "none",
+    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+p_hypoxia_diamond
+```
+```{r}
+hypoxia_gene_df <- hypoxia_mean_df %>%
+  dplyr::select(Method, Gene, Condition, MeanExpression) %>%
+  pivot_wider(
+    names_from = Condition,
+    values_from = MeanExpression
+  ) %>%
+  filter(!is.na(Normoxia) & !is.na(Hypoxia)) %>%
+  mutate(
+    delta = Hypoxia - Normoxia
+  )
+
+hypoxia_gene_long <- hypoxia_gene_df %>%
+  group_by(Method) %>%
+  arrange(delta, .by_group = TRUE) %>%
+  mutate(Gene_order = factor(Gene, levels = unique(Gene))) %>%
+  ungroup() %>%
+  pivot_longer(
+    cols = c(Normoxia, Hypoxia),
+    names_to = "Condition",
+    values_to = "MeanExpression"
+  ) %>%
+  mutate(
+    Condition = factor(Condition, levels = c("Normoxia", "Hypoxia"))
+  )
+
+mean_line_df <- hypoxia_gene_long %>%
+  group_by(Method, Condition) %>%
+  summarise(
+    MeanAll = mean(MeanExpression, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+p_hypoxia_dumbbell <- ggplot(hypoxia_gene_long,
+                             aes(x = MeanExpression, y = Gene_order, group = Gene)) +
+  geom_line(color = "grey70", linewidth = 0.6, alpha = 0.8) +
+  geom_point(aes(fill = Condition),
+             shape = 21, size = 2.8, color = "black", stroke = 0.3) +
+  
+  geom_vline(
+    data = mean_line_df %>% filter(Condition == "Normoxia"),
+    aes(xintercept = MeanAll),
+    color = "#0072B2",
+    linetype = "dashed",
+    linewidth = 0.8,
+    inherit.aes = FALSE
+  ) +
+  geom_vline(
+    data = mean_line_df %>% filter(Condition == "Hypoxia"),
+    aes(xintercept = MeanAll),
+    color = "#D55E00",
+    linetype = "dashed",
+    linewidth = 0.8,
+    inherit.aes = FALSE
+  ) +
+  
+  facet_wrap(~Method, ncol = 3, scales = "free_y") +
+  scale_fill_manual(values = c("Normoxia" = "#0072B2", "Hypoxia" = "#D55E00")) +
+  labs(
+    title = "Leading-edge HALLMARK_HYPOXIA proteins: paired abundance shifts",
+    x = "Mean log2 abundance",
+    y = NULL
+  ) +
+  theme_bw(base_size = 13) +
+  theme(
+    panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+    axis.text.x      = element_text(size = 11, face = "bold"),
+    axis.text.y      = element_text(size = 9, face = "bold"),
+    axis.title       = element_text(size = 14, face = "bold"),
+    strip.text       = element_text(size = 13, face = "bold"),
+    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15),
+    legend.position  = "top",
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+p_hypoxia_dumbbell
+```
+```{r}
+summary_df <- hypoxia_mean_df %>%
+  group_by(Method, Condition) %>%
+  summarise(
+    Mean = mean(MeanExpression, na.rm = TRUE),
+    SD   = sd(MeanExpression, na.rm = TRUE),
+    N    = n(),
+    SE   = SD / sqrt(N),
+    .groups = "drop"
+  )
+
+summary_df$Method <- factor(
+  summary_df$Method,
+  levels = c("Raw", "RF", "minProb", "SoftHybrid", "KNN", "Gaussian")
+)
+
+summary_df$Condition <- factor(
+  summary_df$Condition,
+  levels = c("Normoxia", "Hypoxia")
+)
+
+summary_wide <- summary_df %>%
+  dplyr::select(Method, Condition, Mean, SD) %>%
+  pivot_wider(
+    names_from = Condition,
+    values_from = c(Mean, SD)
+  )
+
+library(ggplot2)
+
+p_summary_dumbbell <- ggplot(summary_wide, aes(y = Method)) +
+  geom_segment(
+    aes(
+      x = Mean_Normoxia,
+      xend = Mean_Hypoxia,
+      yend = Method
+    ),
+    color = "grey50",
+    linewidth = 1.2
+  ) +
+  geom_point(
+    aes(x = Mean_Normoxia),
+    shape = 21,
+    size = 3.5,
+    fill = "#0072B2",
+    color = "black",
+    stroke = 0.4
+  ) +
+  geom_errorbarh(
+    aes(
+      xmin = Mean_Normoxia - SD_Normoxia,
+      xmax = Mean_Normoxia + SD_Normoxia
+    ),
+    height = 0.2,
+    color = "#0072B2",
+    linewidth = 0.8
+  ) +
+  geom_point(
+    aes(x = Mean_Hypoxia),
+    shape = 21,
+    size = 3.5,
+    fill = "#D55E00",
+    color = "black",
+    stroke = 0.4
+  ) +
+  geom_errorbarh(
+    aes(
+      xmin = Mean_Hypoxia - SD_Hypoxia,
+      xmax = Mean_Hypoxia + SD_Hypoxia
+    ),
+    height = 0.2,
+    color = "#D55E00",
+    linewidth = 0.8
+  ) +
+  
+  labs(
+    title = "Mean abundance shift of hypoxia proteins across methods",
+    x = "Mean log2 abundance (± SD)",
+    y = NULL
+  ) +
+  
+  theme_bw(base_size = 13) +
+  theme(
+    panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+    axis.text        = element_text(size = 12, face = "bold"),
+    axis.title       = element_text(size = 14, face = "bold"),
+    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+p_summary_dumbbell
+```
+```{r}
+summary_wide <- summary_df %>%
+  dplyr::select(Method, Condition, Mean, SD) %>%
+  pivot_wider(
+    names_from = Condition,
+    values_from = c(Mean, SD)
+  ) %>%
+  mutate(
+    delta = Mean_Hypoxia - Mean_Normoxia,
+    x_mid = (Mean_Hypoxia + Mean_Normoxia) / 2
+  )
+
+p_summary_dumbbell <- ggplot(summary_wide, aes(y = Method)) +
+  geom_segment(
+    aes(
+      x = Mean_Normoxia,
+      xend = Mean_Hypoxia,
+      yend = Method
+    ),
+    color = "grey50",
+    linewidth = 1.2
+  ) +
+  geom_point(
+    aes(x = Mean_Normoxia),
+    shape = 21,
+    size = 3.5,
+    fill = "#0072B2",
+    color = "black",
+    stroke = 0.4
+  ) +
+  geom_errorbarh(
+    aes(
+      xmin = Mean_Normoxia - SD_Normoxia,
+      xmax = Mean_Normoxia + SD_Normoxia
+    ),
+    height = 0.2,
+    color = "#0072B2",
+    linewidth = 0.8
+  ) +
+  geom_point(
+    aes(x = Mean_Hypoxia),
+    shape = 21,
+    size = 3.5,
+    fill = "#D55E00",
+    color = "black",
+    stroke = 0.4
+  ) +
+  geom_errorbarh(
+    aes(
+      xmin = Mean_Hypoxia - SD_Hypoxia,
+      xmax = Mean_Hypoxia + SD_Hypoxia
+    ),
+    height = 0.2,
+    color = "#D55E00",
+    linewidth = 0.8
+  ) +
+  geom_text(
+    aes(
+      x = x_mid,
+      label = sprintf("\u0394 = %.2f", delta)
+    ),
+    nudge_y = 0.28,
+    size = 4,
+    fontface = "bold"
+  ) +
+  labs(
+    title = "Mean abundance shift of hypoxia proteins across methods",
+    x = "Mean log2 abundance (\u00b1 SD)",
+    y = NULL
+  ) +
+  theme_bw(base_size = 13) +
+  theme(
+    panel.border     = element_rect(colour = "black", fill = NA, linewidth = 0.6),
+    axis.text        = element_text(size = 12, face = "bold"),
+    axis.title       = element_text(size = 14, face = "bold"),
+    plot.title       = element_text(hjust = 0.5, face = "bold", size = 15),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+p_summary_dumbbell
+```
+
+
+# Export
+```{r}
+ggsave(
+  filename = "./figure_benchmarking/HALLMARK_HYPOXIA_missing_rate_raw_bar.tiff",
+  plot = p_hypoxia_missing_bar,
+  device = "tiff",
+  dpi = 300,
+  width = 8,
+  height = 4.5,
+  units = "in"
+)
+
+ggsave(
+  filename = "./figure_benchmarking/HALLMARK_HYPOXIA_p_hypoxia_dumbbell.tiff",
+  plot = p_hypoxia_dumbbell,
+  device = "tiff",
+  dpi = 300,
+  width = 8,
+  height = 10,
+  units = "in"
+)
+
+ggsave(
+  filename = "./figure_benchmarking/HALLMARK_HYPOXIA_p_summary_dumbbell.tiff",
+  plot = p_summary_dumbbell,
+  device = "tiff",
+  dpi = 300,
+  width = 8,
+  height = 4.5,
+  units = "in"
+)
+```
+
+
+
+```{r}
+sessionInfo()
+
 ```
 
 
